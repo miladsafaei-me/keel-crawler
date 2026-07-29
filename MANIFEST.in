@@ -1,0 +1,1 @@
+recursive-include src/keel_crawler/templates *
