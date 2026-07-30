@@ -16,6 +16,7 @@ host scope discovery to the paths it cares about.
 from __future__ import annotations
 
 import gzip
+import io
 import logging
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -75,19 +76,32 @@ def parse_sitemap(content: bytes) -> tuple[list[str], list[str]]:
 
     A ``<sitemapindex>`` yields child sitemaps; a ``<urlset>`` (or anything else with
     ``<loc>`` entries) yields page URLs.
+
+    Streamed with :func:`ET.iterparse` and cleared element-by-element so a large
+    sitemap (the spec allows 50 MB / 50k URLs uncompressed) is parsed with bounded
+    memory instead of building the whole DOM tree at once.
     """
+    child: list[str] = []
+    pages: list[str] = []
+    root_is_index: bool | None = None
     try:
-        root = ET.fromstring(content)
+        for event, elem in ET.iterparse(io.BytesIO(content), events=("start", "end")):
+            tag = _local(elem.tag)
+            if event == "start":
+                if root_is_index is None:  # first start event is the document root
+                    root_is_index = tag == "sitemapindex"
+                continue
+            if tag == "loc":
+                txt = (elem.text or "").strip()
+                if txt:
+                    (child if root_is_index else pages).append(txt)
+            elem.clear()  # free this element's text/children as we go
+    except ET.ParseError:
+        # Return whatever was collected before the malformed point (better than nothing).
+        return child, pages
     except Exception:
         return [], []
-    locs = [
-        (e.text or "").strip()
-        for e in root.iter()
-        if _local(e.tag) == "loc" and e.text and e.text.strip()
-    ]
-    if _local(root.tag) == "sitemapindex":
-        return locs, []
-    return [], locs
+    return child, pages
 
 
 def _robots_sitemaps(origin: str, http_fetcher: Any) -> list[str]:

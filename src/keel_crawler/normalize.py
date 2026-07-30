@@ -37,6 +37,12 @@ def normalize_request_url(url: str) -> tuple[str, str]:
 
     Drops the fragment, lower-cases scheme + host, elides default ports, and
     ensures a ``/`` path so ``https://x`` and ``https://x/`` share one cache row.
+
+    This is the **HTTP cache** identity: it keeps ``www.``, the scheme, and the raw
+    query verbatim because those change the bytes the server returns. It is deliberately
+    distinct from :func:`keel_crawler.browser.harvest.canonical_url_key` (the
+    *discovery* identity, which folds ``www.``/scheme and strips tracking params) — do
+    not substitute one for the other.
     """
     raw = (url or "").strip()
     try:

@@ -19,9 +19,45 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Any, Callable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 _HREF_RE = re.compile(r"""(?:href|data-href|data-url)\s*=\s*["']([^"'#]+)["']""", re.IGNORECASE)
+
+# Query parameters that never change *which page* is served — only analytics/ad
+# attribution. Dropping them from the identity key collapses tracking-tagged copies of
+# one page, WITHOUT touching parameters that select real content (``page``, ``p``,
+# ``id``, ``q``, ``category``, sort/filter facets, …), so pagination and faceted URLs
+# stay distinct and still get crawled.
+_TRACKING_PARAMS = frozenset(
+    {
+        "gclid", "gclsrc", "dclid", "wbraid", "gbraid", "fbclid", "msclkid",
+        "mc_eid", "mc_cid", "_hsenc", "_hsmi", "hsctatracking", "igshid", "yclid",
+        "ttclid", "twclid", "vero_id", "vero_conv", "oly_enc_id", "oly_anon_id",
+        "wickedid", "s_kwcid", "_ga", "_gl", "spm", "scm", "trk", "mkt_tok",
+    }
+)
+_TRACKING_PREFIXES = ("utm_",)
+
+
+def _is_tracking_param(name: str) -> bool:
+    n = (name or "").lower()
+    return n in _TRACKING_PARAMS or n.startswith(_TRACKING_PREFIXES)
+
+
+def _canonical_query(query: str) -> str:
+    """Drop tracking params and sort the rest, so ``?a=1&utm_x=y`` and ``?utm_z=w&a=1``
+    share one key while ``?page=2`` stays distinct from ``?page=3``."""
+    if not query:
+        return ""
+    pairs = [
+        (k, v)
+        for k, v in parse_qsl(query, keep_blank_values=True)
+        if not _is_tracking_param(k)
+    ]
+    if not pairs:
+        return ""
+    pairs.sort()
+    return urlencode(pairs)
 
 # Runs in Playwright after crawl4ai builds the HTML string; page still holds the post-JS DOM.
 DOM_HARVEST_JS = r"""
@@ -73,9 +109,17 @@ document.querySelectorAll('button.nav-item[aria-expanded="false"]').forEach(_cli
 def canonical_url_key(url: str) -> str:
     """Scheme/www/trailing-slash-insensitive identity key for one URL.
 
-    Two URLs that differ only by ``www.``, a trailing slash, or ``http`` vs ``https``
-    collapse to the same key. Shared by :func:`dedupe_urls_preserve_order` and the
-    deep-crawl visited-set so both agree on what "the same page" means.
+    Two URLs that differ only by ``www.``, a trailing slash, ``http`` vs ``https``, the
+    order of query parameters, or a tracking/analytics parameter (``utm_*``, ``gclid``,
+    ``fbclid``, …) collapse to the same key. Content-selecting parameters — pagination
+    (``page``/``p``), ids, search terms, sort/filter facets — are preserved, so those
+    pages remain distinct and still enter the crawl frontier.
+
+    Shared by :func:`dedupe_urls_preserve_order` and the deep-crawl visited-set so both
+    agree on what "the same page" means. Note this is a *discovery* identity and differs
+    intentionally from :func:`keel_crawler.normalize.normalize_request_url` (the HTTP
+    cache key, which keeps ``www.`` and the raw query) — the two answer different
+    questions and must not be conflated.
     """
     u = (url or "").strip()
     if not u:
@@ -88,7 +132,8 @@ def canonical_url_key(url: str) -> str:
         path = p.path or "/"
         if path != "/" and path.endswith("/"):
             path = path[:-1]
-        return f"https://{host}{path}" + (f"?{p.query}" if p.query else "")
+        query = _canonical_query(p.query)
+        return f"https://{host}{path}" + (f"?{query}" if query else "")
     except Exception:
         return u.lower()
 

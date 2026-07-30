@@ -87,6 +87,31 @@ def _gather_visible_text(nodes: list[Any]) -> str:
     return _normalize_blob(" ".join(parts))
 
 
+def _drop_nonvisible(tree: Any) -> None:
+    """Drop script/style/noscript subtrees in place (their text is never visible)."""
+    for bad in tree.xpath("//script|//style|//noscript"):
+        try:
+            bad.drop_tree()
+        except Exception:
+            pass
+
+
+def _full_visible_len(tree: Any) -> int:
+    """Length of ALL visible text in ``tree`` (call after :func:`_drop_nonvisible`).
+
+    This is the JS-shell floor the cheap-first path checks — it counts nav/header/
+    footer text too, matching the old regex ``estimate_visible_text_len`` — but is
+    derived from the same lxml parse that produces the page, so no separate scan runs.
+    """
+    if tree is None:
+        return 0
+    try:
+        parts = tree.xpath("//body//text()") or tree.xpath("//text()")
+        return len(_normalize_blob(" ".join(str(t).strip() for t in parts if t and str(t).strip())))
+    except Exception:
+        return 0
+
+
 def _main_text_from_tree(tree: Any) -> str:
     """Prefer <main>/role=main/<article> after stripping chrome; fall back to <body>.
 
@@ -94,11 +119,7 @@ def _main_text_from_tree(tree: Any) -> str:
     """
     if tree is None:
         return ""
-    for bad in tree.xpath("//script|//style|//noscript"):
-        try:
-            bad.drop_tree()
-        except Exception:
-            pass
+    _drop_nonvisible(tree)
     for tag in ("header", "footer", "nav"):
         for el in list(tree.xpath(f"//{tag}")):
             try:
@@ -272,6 +293,16 @@ def crawl_result_to_page(requested_url: str, result: Any) -> CrawledPage:
     return CrawledPage(url=eff, text=text, title=title, error="", requested_url=req_field)
 
 
+def _page_from_parts(url: str, req_field: str, title: str, text: str) -> CrawledPage:
+    if not text:
+        return CrawledPage(
+            url=url, text="", title=title, error="No extractable text", requested_url=req_field
+        )
+    if len(text) > MAX_TEXT_CHARS_PER_URL:
+        text = text[:MAX_TEXT_CHARS_PER_URL]
+    return CrawledPage(url=url, text=text, title=title, error="", requested_url=req_field)
+
+
 def page_from_html(requested_url: str, html: str, final_url: str = "") -> CrawledPage:
     """Build a :class:`CrawledPage` from raw HTML fetched cheaply (no crawl4ai).
 
@@ -284,10 +315,37 @@ def page_from_html(requested_url: str, html: str, final_url: str = "") -> Crawle
     if not (html or "").strip():
         return CrawledPage(url=url, text="", title="", error="empty HTML", requested_url=req_field)
     title, text = title_and_main_text_from_html(html)
-    if not text:
-        return CrawledPage(
-            url=url, text="", title=title, error="No extractable text", requested_url=req_field
+    return _page_from_parts(url, req_field, title, text)
+
+
+def page_and_visible_len_from_html(
+    requested_url: str, html: str, final_url: str = ""
+) -> tuple[CrawledPage, int]:
+    """Parse cheap HTML **once** → ``(CrawledPage, full_visible_text_len)``.
+
+    The cheap-first hybrid path needs two things from a page: the extracted content
+    (to keep) and a total visible-text length (to decide whether the page is a real
+    document or a near-empty JS shell worth escalating to the browser). Doing both from
+    a single lxml parse — instead of a separate regex scan plus a parse — halves the
+    per-page work on the common HTTP-served path.
+    """
+    url = (final_url or requested_url or "").strip()
+    req_field = requested_url.strip() if (final_url and final_url != requested_url) else ""
+    if not (html or "").strip():
+        return (
+            CrawledPage(url=url, text="", title="", error="empty HTML", requested_url=req_field),
+            0,
         )
-    if len(text) > MAX_TEXT_CHARS_PER_URL:
-        text = text[:MAX_TEXT_CHARS_PER_URL]
-    return CrawledPage(url=url, text=text, title=title, error="", requested_url=req_field)
+    tree = _parse_html(html)
+    if tree is None:
+        return (
+            CrawledPage(
+                url=url, text="", title="", error="No extractable text", requested_url=req_field
+            ),
+            0,
+        )
+    title = _title_from_tree(tree)  # before _main_text_from_tree mutates the tree
+    _drop_nonvisible(tree)
+    visible_len = _full_visible_len(tree)  # counts chrome too — before main-text strips it
+    text = _main_text_from_tree(tree)
+    return _page_from_parts(url, req_field, title, text), visible_len
