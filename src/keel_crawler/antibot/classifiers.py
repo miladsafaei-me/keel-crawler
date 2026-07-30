@@ -85,7 +85,13 @@ def retry_sleep_seconds(error_message: str, attempt_index: int) -> float:
     return min(30.0, 1.2 * (attempt_index + 1))
 
 
+# A Cloudflare challenge page is tiny and its markers all sit in <head>/early <body>.
+# Scanning only the leading slice avoids a full-string ``.lower()`` copy of a real
+# multi-hundred-KB page on every hybrid escalation check.
+_INTERSTITIAL_SCAN_CHARS = 16_384
+
+
 def looks_like_cloudflare_interstitial(html: str) -> bool:
     """Tiny challenge page with no real content — Playwright may still see it."""
-    h = (html or "").lower()
+    h = (html or "")[:_INTERSTITIAL_SCAN_CHARS].lower()
     return ("just a moment" in h and "_cf_chl_opt" in h) or "cf-browser-verification" in h

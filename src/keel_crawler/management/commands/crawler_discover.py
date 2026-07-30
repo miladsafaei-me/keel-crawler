@@ -39,20 +39,24 @@ class Command(BaseCommand):
 
         if do_deep:
             from keel_crawler.discover import (
-                browser_link_fetcher,
+                browser_links_many_fetcher,
                 deep_crawl,
-                http_link_fetcher,
+                http_links_many_fetcher,
             )
 
             if opts["browser"]:
                 from keel_crawler import BrowserFetcher
 
-                fetch_links = browser_link_fetcher(BrowserFetcher.from_config(run_profile="link_harvest"))
+                fetch_many = browser_links_many_fetcher(
+                    BrowserFetcher.from_config(run_profile="link_harvest")
+                )
             else:
                 from keel_crawler import HttpFetcher
 
-                fetch_links = http_link_fetcher(HttpFetcher())
-            urls = deep_crawl([base], fetch_links=fetch_links, max_pages=opts["max"], max_depth=opts["depth"])
+                fetch_many = http_links_many_fetcher(HttpFetcher())
+            urls = deep_crawl(
+                [base], fetch_links_many=fetch_many, max_pages=opts["max"], max_depth=opts["depth"]
+            )
             self.stdout.write(self.style.SUCCESS(f"deep crawl: {len(urls)} URL(s)"))
             found.extend(urls)
 

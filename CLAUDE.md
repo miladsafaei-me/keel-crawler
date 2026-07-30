@@ -69,9 +69,21 @@ by default). `HttpFetcher.fetch_many` is threaded (bounded, order-preserving, sh
 session/cache/throttle); `orchestrate.http_batch_fetch_fn`/`hybrid_batch_fetch_fn` drive
 the parallel `run_batch` path.
 
+Perf/logic pass (v0.7.0): URL **discovery is now level-parallel** — `deep_crawl`
+accepts a batch `fetch_links_many` (adapters `http_links_many_fetcher` /
+`browser_links_many_fetcher`) and fetches a whole BFS level through one paced
+`fetch_many`; `discover_sitemap_urls` fetches same-level sitemaps concurrently
+(`sitemap_workers`). The HTTP cache does **conditional GETs** (`If-None-Match` /
+`If-Modified-Since` from stored validators → a `304` reuses the body and refreshes the
+TTL, no re-download); the three fetch methods now share one `_get_cached` core.
+`_write_cache` upserts in a single statement (`bulk_create(update_conflicts=True)`);
+parallel `run_batch` persists the whole batch with one `bulk_update` instead of N saves.
+`looks_like_cloudflare_interstitial` scans only the leading slice (no full-page lower()).
+
 User playbook: `docs/USING-KEEL-CRAWLER.md`. Remaining ideas: wire the RSS
 `triage_hook` on the keel-content side; a `robots.txt` disallow/politeness gate for
-fetches (discovery already reads robots for sitemaps); observability/metrics.
+fetches (intentionally skipped for now, per owner — discovery already reads robots for
+sitemaps); observability/metrics.
 
 ## Extension pattern (mirror keel-seo / keel-content)
 

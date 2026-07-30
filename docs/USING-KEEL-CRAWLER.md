@@ -53,7 +53,7 @@ only to force a choice (e.g. "use the cheap HTTP fetcher, don't launch a browser
 `requirements.txt`:
 
 ```
-keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.4.0
+keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.7.0
 # opt-in heavy backends:
 #   keel-crawler[browser] @ git+...   # crawl4ai + Playwright + lxml
 #   keel-crawler[rss]     @ git+...   # feedparser
@@ -177,21 +177,31 @@ fetcher = BrowserFetcher.from_config(concurrency=4, rate_per_minute=30)
 ```python
 from keel_crawler import HttpFetcher
 from keel_crawler.discover import (
-    discover_sitemap_urls, deep_crawl, http_link_fetcher, browser_link_fetcher,
+    discover_sitemap_urls, deep_crawl,
+    http_links_many_fetcher, browser_links_many_fetcher,   # parallel (fetch whole level at once)
+    http_link_fetcher, browser_link_fetcher,               # sequential (one page at a time)
 )
 
 http = HttpFetcher()
-# a) from the sitemap (robots.txt -> sitemap index -> child sitemaps; handles .gz):
+# a) from the sitemap (robots.txt -> sitemap index -> child sitemaps; handles .gz).
+#    Same-level sitemaps are fetched concurrently (sitemap_workers):
 urls = discover_sitemap_urls("https://broker.com/", http_fetcher=http,
                              include=lambda u: "/education/" in u)
 
-# b) by following links (breadth-first, same-domain, bounded):
+# b) by following links (breadth-first, same-domain, bounded). Prefer the *_many
+#    adapter: each BFS level is fetched in one concurrent/paced fetch_many call:
 urls = deep_crawl(["https://broker.com/"],
-                  fetch_links=http_link_fetcher(http),   # cheap HTTP+regex
+                  fetch_links_many=http_links_many_fetcher(http),   # cheap HTTP, level-parallel
                   max_pages=200, max_depth=2)
-# JS-rendered nav? use the browser link harvester instead:
-#   fetch_links=browser_link_fetcher(BrowserFetcher.from_config(run_profile="link_harvest"))
+# JS-rendered nav? use the browser link harvester (reuses one pooled browser per level):
+#   fetch_links_many=browser_links_many_fetcher(BrowserFetcher.from_config(run_profile="link_harvest"))
+# (the sequential fetch_links=http_link_fetcher(http) form still works for tiny crawls.)
 ```
+
+The fetch cache does **conditional GETs**: when a cached page's TTL lapses, the next
+fetch sends `If-None-Match`/`If-Modified-Since` from the stored validators, so an
+unchanged page returns a cheap `304` and reuses the cached body instead of
+re-downloading it — recrawls stay fast and polite.
 
 Or the command:
 

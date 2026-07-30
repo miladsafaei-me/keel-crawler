@@ -2,8 +2,28 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import TypeVar
 
 _MAX_TRACKED_HOSTS = 8192
+
+_LockT = TypeVar("_LockT")
+
+
+def prune_host_tracking(
+    last: dict[str, float], locks: dict[str, _LockT]
+) -> tuple[dict[str, float], dict[str, _LockT]]:
+    """Keep the most-recently-seen half of the per-host tracking maps.
+
+    Shared by the sync :class:`HostThrottle` and the async ``AsyncHostThrottle`` (which
+    hold ``threading.Lock`` vs ``asyncio.Lock`` respectively, hence the generic lock
+    type). Evicting a host that is momentarily mid-wait only restarts its interval — a
+    politeness approximation, never a correctness issue.
+    """
+    if not last:
+        return {}, {}
+    keep = sorted(last.items(), key=lambda kv: kv[1])[len(last) // 2 :]
+    keep_hosts = {h for h, _ in keep}
+    return dict(keep), {h: lk for h, lk in locks.items() if h in keep_hosts}
 
 
 class HostThrottle:
@@ -32,19 +52,8 @@ class HostThrottle:
             return lock
 
     def _prune_locked(self) -> None:
-        """Drop the least-recently-seen half of the tracking dicts (guard held).
-
-        Evicting a host that is momentarily mid-``wait`` only means its next request
-        may start a fresh interval — a politeness approximation, never a correctness
-        issue — so this is safe without coordinating with in-flight waiters.
-        """
-        if not self._last:
-            self._locks.clear()
-            return
-        keep = sorted(self._last.items(), key=lambda kv: kv[1])[len(self._last) // 2 :]
-        keep_hosts = {h for h, _ in keep}
-        self._last = dict(keep)
-        self._locks = {h: lk for h, lk in self._locks.items() if h in keep_hosts}
+        """Drop the least-recently-seen half of the tracking dicts (guard held)."""
+        self._last, self._locks = prune_host_tracking(self._last, self._locks)
 
     def wait(self, hostname: str) -> None:
         if self._min <= 0:

@@ -84,7 +84,14 @@ def _page_to_result(page: Any) -> tuple[Optional[str], dict]:
 
 
 def browser_fetch_fn(fetcher: Any) -> FetchFn:
-    """Adapt a Layer-1 ``BrowserFetcher`` to a ``FetchFn``."""
+    """Adapt a Layer-1 ``BrowserFetcher`` to a **sequential** ``FetchFn``.
+
+    Warning: each call runs ``fetch_one``, which opens its own event loop and tears the
+    whole browser pool down afterwards — so a sequential ``run_batch(fetch_fn=...)`` over
+    this rebuilds Chromium per URL and gains nothing from the pool. For more than a
+    couple of URLs prefer :func:`browser_batch_fetch_fn` with ``run_batch(batch_fetch_fn=...)``,
+    which fetches the whole list through one paced, pooled ``fetch_many`` call.
+    """
 
     def _fetch(url: str) -> tuple[Optional[str], dict]:
         return _page_to_result(fetcher.fetch_one(url))
@@ -175,7 +182,13 @@ def _create_jobs_bulk(specs: list[CrawlSpec], batch_id: uuid.UUID) -> list[Crawl
     return jobs
 
 
-def _apply_fetch_result(
+# Fields written when a job reaches a terminal state. Shared by the single-row save
+# (``run_job``) and the batched ``bulk_update`` (parallel ``run_batch``). ``updated_at``
+# is set explicitly in staging because ``bulk_update`` does NOT trigger ``auto_now``.
+_TERMINAL_FIELDS = ["status", "error_text", "result_payload", "attempts", "finished_at", "updated_at"]
+
+
+def _stage_fetch_result(
     job: CrawlJob,
     spec: CrawlSpec,
     text: Optional[str],
@@ -183,23 +196,27 @@ def _apply_fetch_result(
     *,
     progress: Any = None,
 ) -> CrawlJob:
-    """Drive one job from a fetch outcome to a terminal state (parse + save)."""
+    """Mutate ``job`` to its terminal state from a fetch outcome (parse only; no save).
+
+    Parse happens in-process between two states; the transient PARSING row was written
+    and immediately overwritten, so we skip it and land straight on a terminal state.
+    The caller persists — either a single ``save`` (sequential) or one ``bulk_update``
+    for the whole batch (parallel).
+    """
     meta = meta or {}
     attempts = meta.get("attempts")
     if isinstance(attempts, int) and attempts > 0:
         job.attempts = attempts
+    now = timezone.now()
+    job.finished_at = now
+    job.updated_at = now
 
     if not text:
         job.status = CrawlJob.Status.FAILED
         job.error_text = str(meta.get("error") or "fetch returned no text")
         job.result_payload = {"_fetch": meta}
-        job.finished_at = timezone.now()
-        job.save(update_fields=["status", "error_text", "result_payload", "attempts", "finished_at", "updated_at"])
         return job
 
-    # Parse happens in-process between two states; the transient PARSING row was
-    # written and immediately overwritten, so we skip it and go straight to a terminal
-    # state in a single write (attempts folded into that write).
     try:
         payload = spec.parse(text, spec) if spec.parse else {"text": text}
         if not isinstance(payload, dict):
@@ -209,17 +226,27 @@ def _apply_fetch_result(
         job.status = CrawlJob.Status.FAILED
         job.error_text = f"parse error: {exc}"
         job.result_payload = {"_fetch": meta}
-        job.finished_at = timezone.now()
-        job.save(update_fields=["status", "error_text", "result_payload", "attempts", "finished_at", "updated_at"])
         return job
 
     payload.setdefault("_fetch", meta)
     job.status = CrawlJob.Status.SUCCEEDED
     job.result_payload = payload
-    job.finished_at = timezone.now()
-    job.save(update_fields=["status", "result_payload", "attempts", "finished_at", "updated_at"])
     if progress is not None:
         progress.step(f"ok {spec.url[:80]}")
+    return job
+
+
+def _apply_fetch_result(
+    job: CrawlJob,
+    spec: CrawlSpec,
+    text: Optional[str],
+    meta: Optional[dict],
+    *,
+    progress: Any = None,
+) -> CrawlJob:
+    """Stage one job to its terminal state and persist it in a single write."""
+    _stage_fetch_result(job, spec, text, meta, progress=progress)
+    job.save(update_fields=_TERMINAL_FIELDS)
     return job
 
 
@@ -286,7 +313,12 @@ def run_batch(
     if len(results) != len(specs):  # defensive: a misbehaving adapter
         results = (list(results) + [(None, {"error": "missing batch result"})] * len(specs))[: len(specs)]
 
-    return [
-        _apply_fetch_result(job, spec, text, meta, progress=progress)
+    # Parse every result, then persist the whole batch in one bulk_update instead of N
+    # individual UPDATEs (the insert was already one bulk_create above).
+    staged = [
+        _stage_fetch_result(job, spec, text, meta, progress=progress)
         for job, spec, (text, meta) in zip(jobs, specs, results)
     ]
+    if staged:
+        CrawlJob.objects.bulk_update(staged, _TERMINAL_FIELDS, batch_size=500)
+    return staged

@@ -15,6 +15,7 @@ import asyncio
 import time
 
 from keel_crawler.normalize import hostname_of
+from keel_crawler.throttle import prune_host_tracking
 
 
 class AsyncRateLimiter:
@@ -59,10 +60,7 @@ class AsyncHostThrottle:
         self._last: dict[str, float] = {}
 
     def _prune(self) -> None:
-        keep = sorted(self._last.items(), key=lambda kv: kv[1])[len(self._last) // 2 :]
-        keep_hosts = {h for h, _ in keep}
-        self._last = dict(keep)
-        self._locks = {h: lk for h, lk in self._locks.items() if h in keep_hosts}
+        self._last, self._locks = prune_host_tracking(self._last, self._locks)
 
     async def wait(self, url: str) -> None:
         if self._min <= 0:

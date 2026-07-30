@@ -89,16 +89,25 @@ def poll_feeds(
 
     if sources is None:
         sources = FeedSource.objects.filter(is_active=True)
+    sources = list(sources)
     cap = int(max_items_per_feed if max_items_per_feed is not None else rss_setting("max_items_per_feed"))
 
+    # When a Layer-0 fetcher is available, pull every feed's bytes concurrently over the
+    # one shared session/throttle, then parse + stage sequentially (DB work stays on the
+    # main thread). Without a fetcher, feedparser fetches each feed URL itself.
+    prefetched: list[str | None] | None = None
+    if http_fetcher is not None and len(sources) > 1 and hasattr(http_fetcher, "fetch_many"):
+        prefetched = [text for text, _ in http_fetcher.fetch_many([s.url for s in sources], mode="text")]
+
     stats = {"feeds": 0, "new_items": 0, "seen_items": 0, "errors": 0}
-    for source in sources:
+    for idx, source in enumerate(sources):
         stats["feeds"] += 1
         status = "ok"
         try:
-            if http_fetcher is not None:
-                raw = http_fetcher.get_text(source.url)
-                parsed = feedparser.parse(raw or "")
+            if prefetched is not None:
+                parsed = feedparser.parse(prefetched[idx] or "")
+            elif http_fetcher is not None:
+                parsed = feedparser.parse(http_fetcher.get_text(source.url) or "")
             else:
                 parsed = feedparser.parse(source.url)
             entries = list(parsed.entries or [])[: max(0, cap)]

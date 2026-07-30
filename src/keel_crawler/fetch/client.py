@@ -149,12 +149,16 @@ class HttpFetcher:
             ),
         )
 
-    def _load_cache_row(self, key: str) -> CrawlHttpCache | None:
+    def _load_row(self, key: str) -> CrawlHttpCache | None:
+        """Load the single cache row for ``key`` (unique), fresh **or** stale.
+
+        A stale row is still useful: its ``ETag``/``Last-Modified`` let the next fetch
+        be a conditional GET (a 304 avoids re-downloading the body).
+        """
         if not self._enable:
             return None
-        now = timezone.now()
         return (
-            CrawlHttpCache.objects.filter(normalized_url=key, expires_at__gt=now)
+            CrawlHttpCache.objects.filter(normalized_url=key)
             .only(
                 "body_text",
                 "body_truncated",
@@ -165,6 +169,29 @@ class HttpFetcher:
             )
             .first()
         )
+
+    @staticmethod
+    def _row_fresh(row: CrawlHttpCache) -> bool:
+        return row.expires_at is not None and row.expires_at > timezone.now()
+
+    @staticmethod
+    def _cond_headers(row: CrawlHttpCache | None) -> dict[str, str]:
+        """Conditional-GET validators from a (possibly stale) row's stored headers."""
+        if row is None:
+            return {}
+        hdrs = row.headers_json or {}
+        cond: dict[str, str] = {}
+        etag = hdrs.get("ETag") or hdrs.get("Etag") or hdrs.get("etag")
+        last_mod = hdrs.get("Last-Modified") or hdrs.get("last-modified")
+        if etag:
+            cond["If-None-Match"] = str(etag)
+        if last_mod:
+            cond["If-Modified-Since"] = str(last_mod)
+        return cond
+
+    @staticmethod
+    def _is_html(headers: dict[str, str]) -> bool:
+        return "html" in str(headers.get("Content-Type", "")).lower()
 
     def _write_cache(
         self,
@@ -193,19 +220,49 @@ class HttpFetcher:
         if not self._enable:
             return
         sha = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
-        CrawlHttpCache.objects.update_or_create(
+        row = CrawlHttpCache(
             normalized_url=key,
-            defaults={
-                "hostname": hostname[:253],
-                "status_code": status_code,
-                "final_url": (final_url or "")[:2048],
-                "headers_json": hdrs,
-                "body_text": body,
-                "body_truncated": truncated,
-                "sha256_hex": sha,
-                "expires_at": exp,
-            },
+            hostname=hostname[:253],
+            status_code=status_code,
+            final_url=(final_url or "")[:2048],
+            headers_json=hdrs,
+            body_text=body,
+            body_truncated=truncated,
+            sha256_hex=sha,
+            expires_at=exp,
         )
+        # One statement (INSERT ... ON CONFLICT DO UPDATE) instead of update_or_create's
+        # SELECT + INSERT/UPDATE. Falls back for any backend without upsert support.
+        try:
+            CrawlHttpCache.objects.bulk_create(
+                [row],
+                update_conflicts=True,
+                unique_fields=["normalized_url"],
+                update_fields=[
+                    "hostname",
+                    "status_code",
+                    "final_url",
+                    "headers_json",
+                    "body_text",
+                    "body_truncated",
+                    "sha256_hex",
+                    "expires_at",
+                ],
+            )
+        except Exception:
+            CrawlHttpCache.objects.update_or_create(
+                normalized_url=key,
+                defaults={
+                    "hostname": hostname[:253],
+                    "status_code": status_code,
+                    "final_url": (final_url or "")[:2048],
+                    "headers_json": hdrs,
+                    "body_text": body,
+                    "body_truncated": truncated,
+                    "sha256_hex": sha,
+                    "expires_at": exp,
+                },
+            )
 
     def _request_once(
         self,
@@ -262,157 +319,93 @@ class HttpFetcher:
         self._bump_requests()
         return r
 
-    def get_text(self, url: str, *, timeout: int = 18) -> str | None:
-        key, host = normalize_request_url(url)
-        if not key or not host:
-            return None
-        l1 = self._l1_pop_stale(key)
-        if self._l1_negative_hit(l1):
-            return None
-        if l1 is not None and l1.status_code == 200:
-            self._bump_hits()
-            return l1.body_text or None
-        row = self._load_cache_row(key)
-        if row is not None and row.status_code == 200:
-            self._bump_hits()
-            self._l1_put(
-                key,
-                _L1Entry(
-                    expires_at=row.expires_at,
-                    body_text=row.body_text or "",
-                    headers_json=dict(row.headers_json or {}),
-                    status_code=row.status_code,
-                    final_url=row.final_url or key,
-                ),
-            )
-            return row.body_text or None
-        headers = {"User-Agent": self._ua_text(), "Accept": "*/*, application/xml;q=0.9"}
-        fetched = self._request_once(url, timeout=timeout, headers=headers)
-        if fetched is None:
-            return None
-        self._write_cache(
-            key=key,
-            hostname=host,
-            status_code=fetched.status_code,
-            final_url=fetched.final_url,
-            headers=fetched.headers,
-            text=fetched.text,
+    def _serve_from_row(self, key: str, row: CrawlHttpCache) -> _Fetched:
+        """Populate L1 from a fresh DB row and return it as a ``_Fetched``."""
+        self._l1_put(
+            key,
+            _L1Entry(
+                expires_at=row.expires_at,
+                body_text=row.body_text or "",
+                headers_json=dict(row.headers_json or {}),
+                status_code=row.status_code,
+                final_url=row.final_url or key,
+            ),
         )
-        return fetched.text
+        return _Fetched(
+            text=row.body_text or "",
+            final_url=row.final_url or key,
+            status_code=200,
+            headers=dict(row.headers_json or {}),
+        )
 
-    def _get_html_dual_ua(self, url: str, *, timeout: int) -> tuple[str, str] | None:
+    def _get_cached(
+        self,
+        url: str,
+        *,
+        ua_list: tuple[str, ...],
+        accept: str,
+        require_html: bool,
+        timeout: int,
+    ) -> _Fetched | None:
+        """Shared fetch core: L1 → fresh DB serve → conditional/network GET → cache.
+
+        Returns the current document as a ``_Fetched`` (from cache or network), or
+        ``None`` when there is nothing usable. When ``require_html`` is set, a known
+        non-HTML 200 yields ``None`` (no wasted refetch/return), matching the old
+        per-method behaviour; a fresh cached page is served without a network hit, and a
+        stale one is revalidated with ``If-None-Match``/``If-Modified-Since`` so an
+        unchanged page comes back as a cheap 304 instead of a full re-download.
+        """
         key, host = normalize_request_url(url)
         if not key or not host:
             return None
+
         l1 = self._l1_pop_stale(key)
         if self._l1_negative_hit(l1):
             return None
         if l1 is not None and l1.status_code == 200:
-            ct = str((l1.headers_json or {}).get("Content-Type", "")).lower()
             self._bump_hits()
-            # A cached 200 that isn't HTML is known non-HTML for this window — return
-            # None rather than paying a network refetch that would only be discarded.
-            return (l1.body_text or "", l1.final_url or key) if "html" in ct else None
-        row = self._load_cache_row(key)
-        if row is not None and row.status_code == 200:
-            ct = str((row.headers_json or {}).get("Content-Type", "")).lower()
-            self._bump_hits()
-            self._l1_put(
-                key,
-                _L1Entry(
-                    expires_at=row.expires_at,
-                    body_text=row.body_text or "",
-                    headers_json=dict(row.headers_json or {}),
-                    status_code=row.status_code,
-                    final_url=row.final_url or key,
-                ),
+            if require_html and not self._is_html(l1.headers_json or {}):
+                return None
+            return _Fetched(
+                text=l1.body_text or "",
+                final_url=l1.final_url or key,
+                status_code=200,
+                headers=dict(l1.headers_json or {}),
             )
-            return (row.body_text or "", row.final_url or key) if "html" in ct else None
 
-        headers_base = {
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        for ua in (self._ua_html(), self._ua_browser()):
+        row = self._load_row(key)
+        if row is not None and row.status_code == 200 and self._row_fresh(row):
+            self._bump_hits()
+            served = self._serve_from_row(key, row)  # populate L1 even if non-HTML
+            if require_html and not self._is_html(served.headers):
+                return None
+            return served
+
+        cond = self._cond_headers(row)
+        base = {"Accept": accept, "Accept-Language": "en-US,en;q=0.9"}
+        for ua in ua_list:
             fetched = self._request_once(
-                url,
-                timeout=timeout,
-                headers={**headers_base, "User-Agent": ua},
+                url, timeout=timeout, headers={**base, "User-Agent": ua, **cond}
             )
             if fetched is None:
                 continue
-            ct = fetched.headers.get("Content-Type", "")
-            if "html" not in ct.lower():
-                logger.debug("crawl html %s non-html Content-Type: %s", url, ct)
-                # Remember a non-HTML 200 so a repeat HTML fetch short-circuits from the
-                # cache instead of re-hitting the network; still try the other UA in
-                # case it serves HTML (which would overwrite this with the HTML body).
-                if fetched.status_code == 200:
-                    self._write_cache(
-                        key=key,
-                        hostname=host,
-                        status_code=fetched.status_code,
-                        final_url=fetched.final_url,
-                        headers=fetched.headers,
-                        text=fetched.text,
-                    )
-                continue
-            self._write_cache(
-                key=key,
-                hostname=host,
-                status_code=fetched.status_code,
-                final_url=fetched.final_url,
-                headers=fetched.headers,
-                text=fetched.text,
-            )
-            return (fetched.text, fetched.final_url)
-        return None
-
-    def get_html_document_browser_single(
-        self, url: str, *, timeout: int = 8
-    ) -> tuple[str | None, str | None]:
-        """
-        One GET with browser UA only (no bot attempt, no second UA retry).
-        Uses the same HTML cache keys as dual-UA fetches. For --fast discovery only.
-        """
-        key, host = normalize_request_url(url)
-        if not key or not host:
-            return None, None
-        l1 = self._l1_pop_stale(key)
-        if self._l1_negative_hit(l1):
-            return None, None
-        if l1 is not None and l1.status_code == 200:
-            ct = str((l1.headers_json or {}).get("Content-Type", "")).lower()
-            self._bump_hits()
-            return (l1.body_text or "", l1.final_url or key) if "html" in ct else (None, None)
-        row = self._load_cache_row(key)
-        if row is not None and row.status_code == 200:
-            ct = str((row.headers_json or {}).get("Content-Type", "")).lower()
-            self._bump_hits()
-            self._l1_put(
-                key,
-                _L1Entry(
-                    expires_at=row.expires_at,
-                    body_text=row.body_text or "",
-                    headers_json=dict(row.headers_json or {}),
-                    status_code=row.status_code,
+            if fetched.status_code == 304 and row is not None:
+                # Unchanged since the cached copy — refresh its TTL and serve the stored
+                # body without paying to re-download it.
+                self._write_cache(
+                    key=key,
+                    hostname=host,
+                    status_code=200,
                     final_url=row.final_url or key,
-                ),
-            )
-            return (row.body_text or "", row.final_url or key) if "html" in ct else (None, None)
-
-        headers_base = {
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "User-Agent": self._ua_browser(),
-        }
-        fetched = self._request_once(url, timeout=timeout, headers=headers_base)
-        if fetched is None:
-            return None, None
-        ct = fetched.headers.get("Content-Type", "")
-        if "html" not in ct.lower():
-            logger.debug("crawl html fast %s non-html Content-Type: %s", url, ct)
+                    headers=dict(row.headers_json or {}),
+                    text=row.body_text or "",
+                )
+                if require_html and not self._is_html(row.headers_json or {}):
+                    return None
+                return self._serve_from_row(key, row)
             if fetched.status_code == 200:
+                # Cache every 200 (even non-HTML) so a later fetch short-circuits.
                 self._write_cache(
                     key=key,
                     hostname=host,
@@ -421,15 +414,49 @@ class HttpFetcher:
                     headers=fetched.headers,
                     text=fetched.text,
                 )
-            return None, None
-        self._write_cache(
-            key=key,
-            hostname=host,
-            status_code=fetched.status_code,
-            final_url=fetched.final_url,
-            headers=fetched.headers,
-            text=fetched.text,
+                if require_html and not self._is_html(fetched.headers):
+                    logger.debug("crawl html %s non-html Content-Type", url)
+                    continue  # try the next UA in case it serves HTML (anti-cloaking)
+                return fetched
+            return fetched
+        return None
+
+    def get_text(self, url: str, *, timeout: int = 18) -> str | None:
+        fetched = self._get_cached(
+            url,
+            ua_list=(self._ua_text(),),
+            accept="*/*, application/xml;q=0.9",
+            require_html=False,
+            timeout=timeout,
         )
+        return (fetched.text or None) if fetched is not None else None
+
+    def _get_html_dual_ua(self, url: str, *, timeout: int) -> tuple[str, str] | None:
+        fetched = self._get_cached(
+            url,
+            ua_list=(self._ua_html(), self._ua_browser()),
+            accept="text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            require_html=True,
+            timeout=timeout,
+        )
+        return (fetched.text, fetched.final_url) if fetched is not None else None
+
+    def get_html_document_browser_single(
+        self, url: str, *, timeout: int = 8
+    ) -> tuple[str | None, str | None]:
+        """
+        One GET with browser UA only (no bot attempt, no second UA retry).
+        Uses the same HTML cache keys as dual-UA fetches. For --fast discovery only.
+        """
+        fetched = self._get_cached(
+            url,
+            ua_list=(self._ua_browser(),),
+            accept="text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            require_html=True,
+            timeout=timeout,
+        )
+        if fetched is None:
+            return None, None
         return (fetched.text, fetched.final_url)
 
     def get_html_document(self, url: str, *, timeout: int = 18) -> str | None:
