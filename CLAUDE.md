@@ -31,17 +31,20 @@ deduped, staged raw item".
 
 | Layer | Module | Status |
 |---|---|---|
-| 0 Fetch | `fetch/client.py` (`HttpFetcher`); `BrowserFetcher` TODO behind `[browser]` | 0 done |
-| 1 Resilience | anti-bot ladder, `proxy/mihomo*`, classifiers, captcha-solver hook | TODO |
-| 2 Normalize | `clean/markdown.py`; snapshot storage TODO | markdown done |
-| 3 Orchestrate | `CrawlJob` model + `CrawlSpec` TODO; `progress.py` done | progress done |
-| 4 RSS | `rss/` monitor + stage + filter TODO (behind `[rss]`) | TODO |
+| 0 Fetch | `fetch/client.py` (`HttpFetcher`) | done |
+| 1 Resilience | `antibot/classifiers.py`, `proxy/scores.py` + `proxy/mihomo.py`, `browser/{config,extract,engine}.py`, `captcha.py` | done |
+| 2 Normalize | `clean/markdown.py`; snapshot storage still TODO | markdown done |
+| 3 Orchestrate | `models.CrawlJob` + `orchestrate.py` (`CrawlSpec`, `run_batch`, transport adapters); `progress.py` | done |
+| 4 RSS | `models.FeedSource`/`FeedItemCandidate` + `rss/{monitor,filters,triage}.py` + `crawler_rss_poll` (behind `[rss]`) | done |
 
-Layer 1 is the crown jewel to extract next: Revenika's 3-layer retry ladder
-(`admin_os/platform_crawler.py`) + Mihomo client (`crawler_mihomo_api.py`) +
-scoring (`mihomo_proxy_scores.py`). When extracting it, invert the `forex_deep_prune`
-flag and the Mihomo score side-effects into strategy callbacks
-(`content_config_factory`, `on_proxy_result`) — do not carry forex logic across.
+Layer 1 design notes (already applied): the forex `deep_prune` flag became a neutral
+`profile` ("content"/"raw"/"link_harvest") in `browser/config.py`; Mihomo score
+side-effects are injected via the `on_result` hook / an injected `MihomoClient` on
+`BrowserFetcher`; `crawler_factory` is injectable so the ladder is testable without
+crawl4ai. Proxy scoring is disable-able (`proxy_scoring_enabled` / env) and
+resettable (`ProxyScoreStore.reset` + `crawler_proxy_scores --reset`). Still TODO:
+snapshot storage (Layer 2), a `link_harvest` DOM-href harvester, and wiring the RSS
+`triage_hook` on the keel-content side.
 
 ## Extension pattern (mirror keel-seo / keel-content)
 
