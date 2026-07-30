@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import requests
+from requests.adapters import HTTPAdapter
 from django.utils import timezone
 
 from keel_crawler.config import crawler_setting
@@ -57,6 +60,7 @@ class HttpFetcher:
         max_body_chars: int = 1_500_000,
         enable_cache: bool = True,
         l1_max_entries: int = 8192,
+        pool_maxsize: int = 16,
     ) -> None:
         if cache_ttl_seconds is None:
             cache_ttl_seconds = int(crawler_setting("cache_ttl_seconds"))
@@ -64,9 +68,18 @@ class HttpFetcher:
         self._enable = enable_cache
         self._max_body = max(1_000, int(max_body_chars))
         self._session = requests.Session()
+        # Size the urllib3 connection pool for concurrent fetch_many: the default of
+        # 10 would otherwise serialize connections once more than 10 threads run.
+        self._pool_maxsize = max(1, int(pool_maxsize))
+        adapter = HTTPAdapter(pool_connections=self._pool_maxsize, pool_maxsize=self._pool_maxsize)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
         self._throttle = HostThrottle(min_interval_per_host)
         self.requests_made = 0
         self.cache_hits = 0
+        # Guards the L1 OrderedDict and the two counters so ``fetch_many`` can drive
+        # the shared fetcher from several threads without corrupting the cache.
+        self._lock = threading.Lock()
         self._l1_max = max(256, int(l1_max_entries))
         self._l1: OrderedDict[str, _L1Entry] = OrderedDict()
         # Negative cache TTL (permanent 404/410 only): capped so a page that later
@@ -75,6 +88,14 @@ class HttpFetcher:
 
     def metrics(self) -> dict[str, int]:
         return {"http_requests": self.requests_made, "http_cache_hits": self.cache_hits}
+
+    def _bump_requests(self) -> None:
+        with self._lock:
+            self.requests_made = self.requests_made + 1
+
+    def _bump_hits(self) -> None:
+        with self._lock:
+            self.cache_hits = self.cache_hits + 1
 
     def _ua_text(self) -> str:
         return crawler_setting("user_agent_text")
@@ -86,20 +107,23 @@ class HttpFetcher:
         return crawler_setting("browser_user_agent")
 
     def _l1_pop_stale(self, key: str) -> _L1Entry | None:
-        entry = self._l1.get(key)
-        if entry is None:
-            return None
-        if entry.expires_at <= timezone.now():
-            del self._l1[key]
-            return None
-        self._l1.move_to_end(key)
-        return entry
+        now = timezone.now()
+        with self._lock:
+            entry = self._l1.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at <= now:
+                del self._l1[key]
+                return None
+            self._l1.move_to_end(key)
+            return entry
 
     def _l1_put(self, key: str, entry: _L1Entry) -> None:
-        self._l1[key] = entry
-        self._l1.move_to_end(key)
-        while len(self._l1) > self._l1_max:
-            self._l1.popitem(last=False)
+        with self._lock:
+            self._l1[key] = entry
+            self._l1.move_to_end(key)
+            while len(self._l1) > self._l1_max:
+                self._l1.popitem(last=False)
 
     def _l1_negative_hit(self, l1: _L1Entry | None) -> bool:
         """A fresh, non-200 L1 entry marks a URL as known-dead — skip the refetch."""
@@ -199,7 +223,7 @@ class HttpFetcher:
         except requests.RequestException as exc:
             logger.debug("crawl get %s: %s", url, exc)
             return None
-        self.requests_made += 1
+        self._bump_requests()
         try:
             r.raise_for_status()
         except requests.HTTPError as exc:
@@ -235,7 +259,7 @@ class HttpFetcher:
         except requests.RequestException as exc:
             logger.debug("crawl throttled_get %s: %s", url, exc)
             return None
-        self.requests_made += 1
+        self._bump_requests()
         return r
 
     def get_text(self, url: str, *, timeout: int = 18) -> str | None:
@@ -246,11 +270,11 @@ class HttpFetcher:
         if self._l1_negative_hit(l1):
             return None
         if l1 is not None and l1.status_code == 200:
-            self.cache_hits += 1
+            self._bump_hits()
             return l1.body_text or None
         row = self._load_cache_row(key)
         if row is not None and row.status_code == 200:
-            self.cache_hits += 1
+            self._bump_hits()
             self._l1_put(
                 key,
                 _L1Entry(
@@ -285,25 +309,25 @@ class HttpFetcher:
             return None
         if l1 is not None and l1.status_code == 200:
             ct = str((l1.headers_json or {}).get("Content-Type", "")).lower()
-            if "html" in ct:
-                self.cache_hits += 1
-                return (l1.body_text or "", l1.final_url or key)
+            self._bump_hits()
+            # A cached 200 that isn't HTML is known non-HTML for this window — return
+            # None rather than paying a network refetch that would only be discarded.
+            return (l1.body_text or "", l1.final_url or key) if "html" in ct else None
         row = self._load_cache_row(key)
         if row is not None and row.status_code == 200:
             ct = str((row.headers_json or {}).get("Content-Type", "")).lower()
-            if "html" in ct:
-                self.cache_hits += 1
-                self._l1_put(
-                    key,
-                    _L1Entry(
-                        expires_at=row.expires_at,
-                        body_text=row.body_text or "",
-                        headers_json=dict(row.headers_json or {}),
-                        status_code=row.status_code,
-                        final_url=row.final_url or key,
-                    ),
-                )
-                return (row.body_text or "", row.final_url or key)
+            self._bump_hits()
+            self._l1_put(
+                key,
+                _L1Entry(
+                    expires_at=row.expires_at,
+                    body_text=row.body_text or "",
+                    headers_json=dict(row.headers_json or {}),
+                    status_code=row.status_code,
+                    final_url=row.final_url or key,
+                ),
+            )
+            return (row.body_text or "", row.final_url or key) if "html" in ct else None
 
         headers_base = {
             "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
@@ -320,6 +344,18 @@ class HttpFetcher:
             ct = fetched.headers.get("Content-Type", "")
             if "html" not in ct.lower():
                 logger.debug("crawl html %s non-html Content-Type: %s", url, ct)
+                # Remember a non-HTML 200 so a repeat HTML fetch short-circuits from the
+                # cache instead of re-hitting the network; still try the other UA in
+                # case it serves HTML (which would overwrite this with the HTML body).
+                if fetched.status_code == 200:
+                    self._write_cache(
+                        key=key,
+                        hostname=host,
+                        status_code=fetched.status_code,
+                        final_url=fetched.final_url,
+                        headers=fetched.headers,
+                        text=fetched.text,
+                    )
                 continue
             self._write_cache(
                 key=key,
@@ -347,25 +383,23 @@ class HttpFetcher:
             return None, None
         if l1 is not None and l1.status_code == 200:
             ct = str((l1.headers_json or {}).get("Content-Type", "")).lower()
-            if "html" in ct:
-                self.cache_hits += 1
-                return (l1.body_text or "", l1.final_url or key)
+            self._bump_hits()
+            return (l1.body_text or "", l1.final_url or key) if "html" in ct else (None, None)
         row = self._load_cache_row(key)
         if row is not None and row.status_code == 200:
             ct = str((row.headers_json or {}).get("Content-Type", "")).lower()
-            if "html" in ct:
-                self.cache_hits += 1
-                self._l1_put(
-                    key,
-                    _L1Entry(
-                        expires_at=row.expires_at,
-                        body_text=row.body_text or "",
-                        headers_json=dict(row.headers_json or {}),
-                        status_code=row.status_code,
-                        final_url=row.final_url or key,
-                    ),
-                )
-                return (row.body_text or "", row.final_url or key)
+            self._bump_hits()
+            self._l1_put(
+                key,
+                _L1Entry(
+                    expires_at=row.expires_at,
+                    body_text=row.body_text or "",
+                    headers_json=dict(row.headers_json or {}),
+                    status_code=row.status_code,
+                    final_url=row.final_url or key,
+                ),
+            )
+            return (row.body_text or "", row.final_url or key) if "html" in ct else (None, None)
 
         headers_base = {
             "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
@@ -378,6 +412,15 @@ class HttpFetcher:
         ct = fetched.headers.get("Content-Type", "")
         if "html" not in ct.lower():
             logger.debug("crawl html fast %s non-html Content-Type: %s", url, ct)
+            if fetched.status_code == 200:
+                self._write_cache(
+                    key=key,
+                    hostname=host,
+                    status_code=fetched.status_code,
+                    final_url=fetched.final_url,
+                    headers=fetched.headers,
+                    text=fetched.text,
+                )
             return None, None
         self._write_cache(
             key=key,
@@ -402,3 +445,48 @@ class HttpFetcher:
         if not pair:
             return None, None
         return pair
+
+    def fetch_many(
+        self,
+        urls: list[str],
+        *,
+        mode: str = "html",
+        timeout: int = 18,
+        max_workers: int | None = None,
+    ) -> list[tuple[str | None, str | None]]:
+        """Fetch many URLs concurrently over the **one shared** session/cache/throttle.
+
+        Returns one ``(text_or_None, final_url_or_None)`` per input URL, in input
+        order. ``mode`` = ``"html"`` (dual-UA HTML, final_url after redirects) or
+        ``"text"`` (raw text; final_url is always ``None``).
+
+        ``requests`` blocks per thread, so a thread pool gives real parallelism across
+        hosts while the per-host throttle keeps each individual site polite and the L1
+        cache is shared (one fetch of a repeated URL serves the whole batch). Bounded by
+        ``max_workers`` (default: the connection-pool size).
+        """
+        if not urls:
+            return []
+        workers = int(max_workers if max_workers is not None else self._pool_maxsize)
+        workers = max(1, min(workers, len(urls)))
+
+        def _one(u: str) -> tuple[str | None, str | None]:
+            if mode == "text":
+                return self.get_text(u, timeout=timeout), None
+            return self.get_html_document_with_final_url(u, timeout=timeout)
+
+        if workers == 1:
+            return [_one(u) for u in urls]
+
+        def _worker(u: str) -> tuple[str | None, str | None]:
+            # Each pool thread gets its own thread-local Django DB connection; close it
+            # at the end of the task so the pool doesn't leak connections.
+            from django.db import connection
+
+            try:
+                return _one(u)
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(_worker, urls))

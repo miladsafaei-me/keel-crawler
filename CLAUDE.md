@@ -31,7 +31,7 @@ deduped, staged raw item".
 
 | Layer | Module | Status |
 |---|---|---|
-| 0 Fetch | `fetch/client.py` (`HttpFetcher`) | done |
+| 0 Fetch | `fetch/client.py` (`HttpFetcher`, concurrent `fetch_many`) + `fetch/hybrid.py` (`HybridFetcher`, cheap-first) | done |
 | 1 Resilience | `antibot/classifiers.py`, `proxy/scores.py` + `proxy/mihomo.py`, `browser/{config,extract,engine}.py`, `captcha.py` | done |
 | 2 Normalize | `clean/markdown.py` + `clean/snapshot.py` (`SnapshotStore`, `build_merged_markdown`) | done |
 | 3 Orchestrate | `models.CrawlJob` + `orchestrate.py` (`CrawlSpec`, `run_batch`, transport adapters); `progress.py` | done |
@@ -57,6 +57,17 @@ Cross-cutting (v0.4.0): `pace.py` (`AsyncRateLimiter` evenly-spaced global rate 
 `KEEL_CRAWLER["fetch"]`. `discover.py` does **URL discovery**: `discover_sitemap_urls`
 (robots → sitemap index → children, gz-aware) and `deep_crawl` (BFS link-follow with
 `http_link_fetcher`/`browser_link_fetcher` adapters); `crawler_discover` command.
+
+Cheap-first (v0.6.0): `HybridFetcher` (`fetch/hybrid.py`) tries a cheap HTTP GET first
+and escalates to the browser engine only when a page comes back empty, challenged, or
+below a visible-text floor (`needs_browser` predicate, injectable) — so a batch launches
+Chromium only for the pages that actually need it. When the browser *is* used,
+`BrowserFetcher` now reuses a small pool of Chromium sessions keyed by egress
+(direct/proxy) across the whole batch instead of launching one per URL, and the
+egress-IP probe (an extra ipify round-trip per page) is opt-in (`probe_egress_ip`, off
+by default). `HttpFetcher.fetch_many` is threaded (bounded, order-preserving, shared
+session/cache/throttle); `orchestrate.http_batch_fetch_fn`/`hybrid_batch_fetch_fn` drive
+the parallel `run_batch` path.
 
 User playbook: `docs/USING-KEEL-CRAWLER.md`. Remaining ideas: wire the RSS
 `triage_hook` on the keel-content side; a `robots.txt` disallow/politeness gate for

@@ -106,32 +106,73 @@ def browser_batch_fetch_fn(fetcher: Any) -> BatchFetchFn:
     return _fetch
 
 
-def http_batch_fetch_fn(fetcher: Any, *, mode: str = "html") -> BatchFetchFn:
-    """Adapt a Layer-0 ``HttpFetcher`` to a ``BatchFetchFn``.
+def hybrid_batch_fetch_fn(fetcher: Any) -> BatchFetchFn:
+    """Adapt a cheap-first ``HybridFetcher`` to a ``BatchFetchFn``.
 
-    ``requests`` is synchronous, so this fetches sequentially — but over the **one
-    shared** fetcher, so the HTTP session (connection pool), the L1/DB cache, and the
-    per-host throttle are reused across the whole batch instead of being rebuilt per
-    URL.
+    Same shape as :func:`browser_batch_fetch_fn` — the hybrid fetcher returns
+    ``CrawledPage`` objects too — but most URLs are served over cheap HTTP and only the
+    inadequate ones escalate to the browser, so a batch launches Chromium only for the
+    pages that actually need it.
     """
-    per_url = http_fetch_fn(fetcher, mode=mode)
 
     def _fetch(urls: list[str]) -> list[tuple[Optional[str], dict]]:
-        return [per_url(u) for u in urls]
+        return [_page_to_result(p) for p in fetcher.fetch_many(list(urls))]
 
     return _fetch
 
 
-def _create_job(spec: CrawlSpec, batch_id: uuid.UUID) -> CrawlJob:
-    return CrawlJob.objects.create(
+def http_batch_fetch_fn(
+    fetcher: Any, *, mode: str = "html", max_workers: int | None = None
+) -> BatchFetchFn:
+    """Adapt a Layer-0 ``HttpFetcher`` to a ``BatchFetchFn`` via its concurrent
+    ``fetch_many``.
+
+    ``requests`` blocks per thread, so the whole URL list is fetched over a bounded
+    thread pool on the **one shared** fetcher — the HTTP session (connection pool),
+    the L1/DB cache, and the per-host throttle are all reused, and independent hosts
+    fetch in parallel instead of strictly one-at-a-time.
+    """
+
+    def _fetch(urls: list[str]) -> list[tuple[Optional[str], dict]]:
+        pairs = fetcher.fetch_many(list(urls), mode=mode, max_workers=max_workers)
+        if mode == "text":
+            return [(text, {"transport": "http", "mode": "text"}) for text, _ in pairs]
+        return [
+            (text, {"transport": "http", "mode": "html", "final_url": final_url or ""})
+            for text, final_url in pairs
+        ]
+
+    return _fetch
+
+
+def _new_job(spec: CrawlSpec, batch_id: uuid.UUID, now: Any) -> CrawlJob:
+    return CrawlJob(
         batch_id=batch_id,
         label=spec.label,
         target_url=spec.url,
         input_snapshot=dict(spec.metadata or {}),
         status=CrawlJob.Status.FETCHING,
-        started_at=timezone.now(),
+        started_at=now,
         attempts=1,
     )
+
+
+def _create_job(spec: CrawlSpec, batch_id: uuid.UUID) -> CrawlJob:
+    job = _new_job(spec, batch_id, timezone.now())
+    job.save()
+    return job
+
+
+def _create_jobs_bulk(specs: list[CrawlSpec], batch_id: uuid.UUID) -> list[CrawlJob]:
+    """Insert all FETCHING jobs in one query instead of N. Falls back to per-row
+    creation if the backend doesn't return primary keys from ``bulk_create`` (needed
+    because each job is updated in place afterwards).
+    """
+    now = timezone.now()
+    jobs = CrawlJob.objects.bulk_create([_new_job(s, batch_id, now) for s in specs])
+    if jobs and jobs[0].pk is None:  # backend didn't populate PKs — do it the slow way
+        return [_create_job(s, batch_id) for s in specs]
+    return jobs
 
 
 def _apply_fetch_result(
@@ -156,8 +197,9 @@ def _apply_fetch_result(
         job.save(update_fields=["status", "error_text", "result_payload", "attempts", "finished_at", "updated_at"])
         return job
 
-    job.status = CrawlJob.Status.PARSING
-    job.save(update_fields=["status", "attempts", "updated_at"])
+    # Parse happens in-process between two states; the transient PARSING row was
+    # written and immediately overwritten, so we skip it and go straight to a terminal
+    # state in a single write (attempts folded into that write).
     try:
         payload = spec.parse(text, spec) if spec.parse else {"text": text}
         if not isinstance(payload, dict):
@@ -168,14 +210,14 @@ def _apply_fetch_result(
         job.error_text = f"parse error: {exc}"
         job.result_payload = {"_fetch": meta}
         job.finished_at = timezone.now()
-        job.save(update_fields=["status", "error_text", "result_payload", "finished_at", "updated_at"])
+        job.save(update_fields=["status", "error_text", "result_payload", "attempts", "finished_at", "updated_at"])
         return job
 
     payload.setdefault("_fetch", meta)
     job.status = CrawlJob.Status.SUCCEEDED
     job.result_payload = payload
     job.finished_at = timezone.now()
-    job.save(update_fields=["status", "result_payload", "finished_at", "updated_at"])
+    job.save(update_fields=["status", "result_payload", "attempts", "finished_at", "updated_at"])
     if progress is not None:
         progress.step(f"ok {spec.url[:80]}")
     return job
@@ -231,8 +273,9 @@ def run_batch(
     if fetch_fn is not None:
         return [run_job(s, fetch_fn=fetch_fn, batch_id=bid, progress=progress) for s in specs]
 
-    # Parallel path: create all jobs, fetch the whole URL list at once, then parse.
-    jobs = [_create_job(s, bid) for s in specs]
+    # Parallel path: create all jobs (one bulk insert), fetch the whole URL list at
+    # once, then parse.
+    jobs = _create_jobs_bulk(specs, bid)
     if progress is not None:
         progress.step(f"fetch {len(specs)} url(s) in parallel")
     try:

@@ -195,16 +195,20 @@ def deep_crawl(
     seed_domains = {normalize_domain_from_url(s) for s in seed_list}
     seed_domains.discard(None)
 
+    # Mark a URL seen when it is ENQUEUED, not when it is popped: a popular link (e.g.
+    # the homepage) appears on nearly every page, so pop-time marking would let it
+    # queue once per referring page and bloat the queue. Seeds are pre-marked too.
     seen: set[str] = set()
     visited: list[str] = []
-    queue: deque[tuple[str, int]] = deque((s, 0) for s in seed_list)
+    queue: deque[tuple[str, int]] = deque()
+    for s in seed_list:
+        sk = canonical_url_key(s)
+        if sk and sk not in seen:
+            seen.add(sk)
+            queue.append((s, 0))
 
     while queue and len(visited) < max_pages:
         url, depth = queue.popleft()
-        k = canonical_url_key(url)
-        if not k or k in seen:
-            continue
-        seen.add(k)
         visited.append(url)
         if progress is not None:
             progress.step(f"depth {depth}: {url[:80]}")
@@ -224,6 +228,7 @@ def deep_crawl(
                 continue
             lk = canonical_url_key(link)
             if lk and lk not in seen:
+                seen.add(lk)
                 queue.append((link, depth + 1))
 
     return visited

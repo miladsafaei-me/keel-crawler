@@ -9,13 +9,20 @@ bare ``import keel_crawler`` never pulls in the Django model before settings are
 configured — the submodule loads only on first attribute access.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
-__all__ = ["HttpFetcher", "normalize_request_url", "BrowserFetcher", "CrawledPage"]
+__all__ = [
+    "HttpFetcher",
+    "HybridFetcher",
+    "normalize_request_url",
+    "BrowserFetcher",
+    "CrawledPage",
+]
 
 # Lazy so a bare import never pulls in Django models / crawl4ai before settings load.
 _LAZY = {
     "HttpFetcher": ("keel_crawler.fetch.client", "HttpFetcher"),
+    "HybridFetcher": ("keel_crawler.fetch.hybrid", "HybridFetcher"),
     "normalize_request_url": ("keel_crawler.normalize", "normalize_request_url"),
     "BrowserFetcher": ("keel_crawler.browser.engine", "BrowserFetcher"),
     "CrawledPage": ("keel_crawler.browser.extract", "CrawledPage"),

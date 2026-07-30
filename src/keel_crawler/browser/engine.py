@@ -182,6 +182,7 @@ class BrowserFetcher:
         crawler_factory: Optional[Callable[[Any], Any]] = None,
         link_match: Optional[Callable[[str, str, str], bool]] = None,
         link_deny: Optional[Callable[[str], bool]] = None,
+        probe_egress_ip: bool = False,
     ) -> None:
         self._proxy_url = (proxy_url or "").strip() or None
         self._mihomo = mihomo
@@ -204,6 +205,16 @@ class BrowserFetcher:
         # link_harvest: relevance filter for the static-HTML pass (default: keep all).
         self._link_match = link_match
         self._link_deny = link_deny
+        # Egress-IP probing costs one extra in-page request (ipify) per crawl, so it is
+        # off by default — turn it on only when diagnosing proxy rotation.
+        self._probe_egress_ip = bool(probe_egress_ip)
+        # Reusable browser pool, keyed by egress ("direct"/"proxy"). A crawler is
+        # borrowed for the exclusive duration of one page fetch (so per-fetch hook
+        # installs never race) and returned for the next URL, instead of launching a
+        # fresh Chromium per URL. Opened lazily; closed at the end of a batch.
+        self._free_crawlers: dict[str, list[Any]] = {"direct": [], "proxy": []}
+        self._all_crawlers: list[Any] = []
+        self._pool_lock = asyncio.Lock()
 
     @classmethod
     def from_config(cls, **overrides: Any) -> "BrowserFetcher":
@@ -284,7 +295,7 @@ class BrowserFetcher:
     ) -> tuple[CrawledPage, str]:
         strategy = getattr(crawler, "crawler_strategy", None)
         holder: list[str] = [""]
-        prev_hook = _install_egress_hook(strategy, holder)
+        prev_hook = _install_egress_hook(strategy, holder) if self._probe_egress_ip else None
         harvesting = self._profile == "link_harvest"
         disc_accum: list[str] = []
         disc_prev = install_discovery_hooks(strategy, disc_accum, set()) if harvesting else {}
@@ -333,18 +344,67 @@ class BrowserFetcher:
             return last_page, last_ip
         finally:
             last_page.attempts = max(1, attempts_used)
-            _restore_egress_hook(strategy, prev_hook)
+            if self._probe_egress_ip:
+                _restore_egress_hook(strategy, prev_hook)
             if harvesting:
                 restore_discovery_hooks(strategy, disc_prev)
 
-    async def _crawl_new_session(self, url: str, timeout: int, *, force_proxy: bool) -> CrawledPage:
-        browser_cfg = self._browser_config(force_proxy=force_proxy)
-        via_proxy = bool(force_proxy and self._proxy_url)
+    async def _acquire_crawler(self, key: str, *, force_proxy: bool) -> Any:
+        """Borrow a started crawler for ``key`` egress (reuse a free one or open one)."""
+        async with self._pool_lock:
+            free = self._free_crawlers.setdefault(key, [])
+            if free:
+                return free.pop()
+        crawler = self._crawler_factory(self._browser_config(force_proxy=force_proxy))
+        await crawler.__aenter__()
+        async with self._pool_lock:
+            self._all_crawlers.append(crawler)
+        return crawler
+
+    async def _release_crawler(self, key: str, crawler: Any, *, discard: bool) -> None:
+        """Return a crawler to the free pool, or tear it down if it faulted."""
+        if not discard:
+            async with self._pool_lock:
+                self._free_crawlers.setdefault(key, []).append(crawler)
+            return
+        async with self._pool_lock:
+            if crawler in self._all_crawlers:
+                self._all_crawlers.remove(crawler)
+            free = self._free_crawlers.get(key)
+            if free and crawler in free:
+                free.remove(crawler)
         try:
-            async with self._crawler_factory(browser_cfg) as crawler:
-                page, obs_ip = await self._crawl_with_retries(crawler, url, timeout)
+            await crawler.__aexit__(None, None, None)
+        except Exception:
+            logger.debug("crawler teardown raised", exc_info=True)
+
+    async def _close_pool(self) -> None:
+        """Close every open crawler. Call once a batch (or single fetch) is done."""
+        async with self._pool_lock:
+            crawlers = list(self._all_crawlers)
+            self._all_crawlers.clear()
+            for lst in self._free_crawlers.values():
+                lst.clear()
+        for crawler in crawlers:
+            try:
+                await crawler.__aexit__(None, None, None)
+            except Exception:
+                logger.debug("crawler teardown raised", exc_info=True)
+
+    async def _crawl_new_session(self, url: str, timeout: int, *, force_proxy: bool) -> CrawledPage:
+        via_proxy = bool(force_proxy and self._proxy_url)
+        key = "proxy" if via_proxy else "direct"
+        crawler = await self._acquire_crawler(key, force_proxy=force_proxy)
+        faulted = False
+        try:
+            page, obs_ip = await self._crawl_with_retries(crawler, url, timeout)
         except Exception as exc:
+            # A crawler that raises out of arun may be in a bad state — drop it so the
+            # next fetch opens a clean one rather than reusing a broken browser.
+            faulted = True
             page, obs_ip = CrawledPage(url=url, text="", error=str(exc)), ""
+        finally:
+            await self._release_crawler(key, crawler, discard=faulted)
         page = with_egress(page, via_proxy=via_proxy, egress_ip=obs_ip)
         self._notify_result(via_proxy=via_proxy, success=page.ok())
         return page
@@ -436,27 +496,41 @@ class BrowserFetcher:
     async def afetch_many(self, urls: list[str]) -> list[CrawledPage]:
         """Crawl URLs concurrently (bounded by ``concurrency``), paced by the rate
         limiter, and polite per host. Results preserve input order.
+
+        Reuses a small pool of Chromium sessions across the whole batch and closes it
+        when the batch finishes.
         """
         if not urls:
             return []
         sem = asyncio.Semaphore(self._concurrency)
 
         async def worker(u: str) -> CrawledPage:
+            # Pace the START of each unit of work (global spacing) and respect per-host
+            # politeness BEFORE taking a concurrency slot — a worker sleeping for
+            # politeness must not occupy one of the limited browser slots.
+            await self._rate.acquire()
+            await self._host_throttle.wait(u)
             async with sem:
-                # Pace the START of each unit of work so a big batch trickles out
-                # instead of bursting; then respect per-host politeness.
-                await self._rate.acquire()
-                await self._host_throttle.wait(u)
                 try:
                     return await self.afetch_one(u)
                 except Exception as exc:
                     return CrawledPage(url=u, text="", error=str(exc))
 
-        return await asyncio.gather(*(worker(u) for u in urls))
+        try:
+            return await asyncio.gather(*(worker(u) for u in urls))
+        finally:
+            await self._close_pool()
 
     def fetch_one(self, url: str) -> CrawledPage:
         """Sync wrapper around :meth:`afetch_one` (opens its own event loop)."""
-        return asyncio.run(self.afetch_one(url))
+
+        async def _run() -> CrawledPage:
+            try:
+                return await self.afetch_one(url)
+            finally:
+                await self._close_pool()
+
+        return asyncio.run(_run())
 
     def fetch_many(self, urls: list[str]) -> list[CrawledPage]:
         """Sync wrapper around :meth:`afetch_many`."""

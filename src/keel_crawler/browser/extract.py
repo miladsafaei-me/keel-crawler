@@ -42,19 +42,32 @@ def _normalize_blob(s: str) -> str:
     return " ".join((s or "").split())
 
 
-def _title_from_html_fragment(html_fragment: str | None) -> str:
-    if not html_fragment or not html_fragment.strip():
-        return ""
+def _parse_html(html_str: str | None) -> Any:
+    """Parse HTML into an lxml tree once, or ``None`` on any failure. lxml is lazy."""
+    if not html_str or not html_str.strip():
+        return None
     try:
         from lxml import html as lxml_html
 
-        tree = lxml_html.fromstring(html_fragment)
+        return lxml_html.fromstring(html_str)
+    except Exception:
+        return None
+
+
+def _title_from_tree(tree: Any) -> str:
+    if tree is None:
+        return ""
+    try:
         titles = tree.xpath("//title/text()")
         if titles:
             return " ".join(str(titles[0]).split())
     except Exception:
         pass
     return ""
+
+
+def _title_from_html_fragment(html_fragment: str | None) -> str:
+    return _title_from_tree(_parse_html(html_fragment))
 
 
 def _gather_visible_text(nodes: list[Any]) -> str:
@@ -74,17 +87,13 @@ def _gather_visible_text(nodes: list[Any]) -> str:
     return _normalize_blob(" ".join(parts))
 
 
-def main_content_text_from_html(html_str: str) -> str:
-    """Prefer <main>/role=main/<article> after stripping chrome; fall back to <body>."""
-    if not (html_str or "").strip():
-        return ""
-    try:
-        from lxml import html as lxml_html
+def _main_text_from_tree(tree: Any) -> str:
+    """Prefer <main>/role=main/<article> after stripping chrome; fall back to <body>.
 
-        tree = lxml_html.fromstring(html_str)
-    except Exception:
+    Mutates ``tree`` (drops chrome nodes), so extract any title BEFORE calling this.
+    """
+    if tree is None:
         return ""
-
     for bad in tree.xpath("//script|//style|//noscript"):
         try:
             bad.drop_tree()
@@ -113,6 +122,24 @@ def main_content_text_from_html(html_str: str) -> str:
         return _normalize_blob(" ".join(str(t).strip() for t in parts if t and str(t).strip()))
     except Exception:
         return ""
+
+
+def main_content_text_from_html(html_str: str) -> str:
+    """Prefer <main>/role=main/<article> after stripping chrome; fall back to <body>."""
+    return _main_text_from_tree(_parse_html(html_str))
+
+
+def title_and_main_text_from_html(html_str: str) -> tuple[str, str]:
+    """Parse ``html_str`` **once** and return ``(title, main_text)``.
+
+    Used by the cheap-first path so an HTTP-served page pays a single lxml parse for
+    both its title and its main content instead of two.
+    """
+    tree = _parse_html(html_str)
+    if tree is None:
+        return "", ""
+    title = _title_from_tree(tree)  # before _main_text_from_tree mutates the tree
+    return title, _main_text_from_tree(tree)
 
 
 def _text_from_cleaned_html(html_str: str) -> str:
@@ -243,3 +270,24 @@ def crawl_result_to_page(requested_url: str, result: Any) -> CrawledPage:
     if len(text) > MAX_TEXT_CHARS_PER_URL:
         text = text[:MAX_TEXT_CHARS_PER_URL]
     return CrawledPage(url=eff, text=text, title=title, error="", requested_url=req_field)
+
+
+def page_from_html(requested_url: str, html: str, final_url: str = "") -> CrawledPage:
+    """Build a :class:`CrawledPage` from raw HTML fetched cheaply (no crawl4ai).
+
+    The cheap-first path uses this so an HTTP-served page goes through the same
+    main-content + title DOM heuristics as a browser-served one — downstream code sees
+    one consistent shape regardless of transport.
+    """
+    url = (final_url or requested_url or "").strip()
+    req_field = requested_url.strip() if (final_url and final_url != requested_url) else ""
+    if not (html or "").strip():
+        return CrawledPage(url=url, text="", title="", error="empty HTML", requested_url=req_field)
+    title, text = title_and_main_text_from_html(html)
+    if not text:
+        return CrawledPage(
+            url=url, text="", title=title, error="No extractable text", requested_url=req_field
+        )
+    if len(text) > MAX_TEXT_CHARS_PER_URL:
+        text = text[:MAX_TEXT_CHARS_PER_URL]
+    return CrawledPage(url=url, text=text, title=title, error="", requested_url=req_field)

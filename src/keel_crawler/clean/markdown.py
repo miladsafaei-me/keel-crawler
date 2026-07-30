@@ -47,12 +47,19 @@ def _norm_block_key(block: str) -> str:
     return re.sub(r"\s+", " ", block.strip().lower())
 
 
-def _dedupe_lines_globally(text: str) -> str:
+# Only globally dedupe lines at least this long. Shorter lines (headings, list items,
+# table cells, separators, repeated short data values) are kept verbatim — dropping a
+# recurring "Yes" or "$100" or a section heading loses real content, whereas long
+# repeated lines are almost always boilerplate worth collapsing.
+_MIN_DEDUPE_LINE_LEN = 40
+
+
+def _dedupe_lines_globally(text: str, *, min_len: int = _MIN_DEDUPE_LINE_LEN) -> str:
     seen: set[str] = set()
     out: list[str] = []
     for line in text.split("\n"):
         key = _norm_block_key(line) if line.strip() else ""
-        if not key:
+        if not key or len(key) < min_len:
             out.append(line)
             continue
         if key in seen:
