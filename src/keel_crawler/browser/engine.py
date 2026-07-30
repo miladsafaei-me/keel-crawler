@@ -34,6 +34,12 @@ from keel_crawler.antibot.classifiers import (
 )
 from keel_crawler.browser.config import build_browser_config, build_run_config
 from keel_crawler.browser.extract import CrawledPage, crawl_result_to_page, with_egress
+from keel_crawler.browser.harvest import (
+    dedupe_urls_preserve_order,
+    extract_links_from_html,
+    install_discovery_hooks,
+    restore_discovery_hooks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +185,8 @@ class BrowserFetcher:
         egress_store: EgressPreferenceStore | None = None,
         on_result: Optional[Callable[[bool, bool], None]] = None,
         crawler_factory: Optional[Callable[[Any], Any]] = None,
+        link_match: Optional[Callable[[str, str, str], bool]] = None,
+        link_deny: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self._proxy_url = (proxy_url or "").strip() or None
         self._mihomo = mihomo
@@ -193,6 +201,9 @@ class BrowserFetcher:
         self._egress = egress_store or EgressPreferenceStore()
         self._on_result = on_result
         self._crawler_factory = crawler_factory or self._default_crawler_factory
+        # link_harvest: relevance filter for the static-HTML pass (default: keep all).
+        self._link_match = link_match
+        self._link_deny = link_deny
 
     @classmethod
     def from_config(cls, **overrides: Any) -> "BrowserFetcher":
@@ -253,12 +264,25 @@ class BrowserFetcher:
             return False
         return True
 
+    def _collect_discovery(self, accum: list[str], result: Any, base_url: str) -> list[str]:
+        """Merge JS-harvested hrefs with a static-HTML pass over the returned document."""
+        static = extract_links_from_html(
+            str(getattr(result, "html", "") or ""),
+            base_url,
+            match=self._link_match,
+            deny=self._link_deny,
+        )
+        return dedupe_urls_preserve_order(list(accum) + static)
+
     async def _crawl_with_retries(
         self, crawler: Any, url: str, base_timeout: int
     ) -> tuple[CrawledPage, str]:
         strategy = getattr(crawler, "crawler_strategy", None)
         holder: list[str] = [""]
         prev_hook = _install_egress_hook(strategy, holder)
+        harvesting = self._profile == "link_harvest"
+        disc_accum: list[str] = []
+        disc_prev = install_discovery_hooks(strategy, disc_accum, set()) if harvesting else {}
         attempt_timeout = base_timeout
         last_page = CrawledPage(url=url, text="", error="")
         last_ip = ""
@@ -267,20 +291,33 @@ class BrowserFetcher:
         try:
             for attempt in range(hard_cap):
                 holder[0] = ""
+                result = None
                 try:
                     result = await crawler.arun(url=url, config=self._run_config(attempt_timeout))
                     last_ip = (holder[0] or "").strip()[:64]
                     last_page = crawl_result_to_page(url, result)
                     err = last_page.error or ""
                     if not err:
+                        if harvesting:
+                            last_page.discovery_hrefs = self._collect_discovery(
+                                disc_accum, result, last_page.url
+                            )
                         return last_page, last_ip
                 except Exception as exc:
                     err = str(exc)
                     last_ip = (holder[0] or "").strip()[:64]
                     last_page = CrawledPage(url=url, text="", error=err)
                 if attempt >= hard_cap - 1 or not should_retry_error(err):
+                    if harvesting:
+                        last_page.discovery_hrefs = self._collect_discovery(
+                            disc_accum, result, last_page.url
+                        )
                     return last_page, last_ip
                 if attempt + 1 >= base_cap and not is_rate_limit_error(err):
+                    if harvesting:
+                        last_page.discovery_hrefs = self._collect_discovery(
+                            disc_accum, result, last_page.url
+                        )
                     return last_page, last_ip
                 attempt_timeout = min(
                     base_timeout + _RETRY_TIMEOUT_BUMP_SEC * (attempt + 1), _RETRY_MAX_TIMEOUT_SEC
@@ -289,6 +326,8 @@ class BrowserFetcher:
             return last_page, last_ip
         finally:
             _restore_egress_hook(strategy, prev_hook)
+            if harvesting:
+                restore_discovery_hooks(strategy, disc_prev)
 
     async def _crawl_new_session(self, url: str, timeout: int, *, force_proxy: bool) -> CrawledPage:
         browser_cfg = self._browser_config(force_proxy=force_proxy)

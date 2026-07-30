@@ -9,17 +9,19 @@ today; the rest land in later versions (see the roadmap).
 | Layer | Concern | Status |
 |---|---|---|
 | **0 — Fetch** | Cheap-first `HttpFetcher`: `requests` + per-host throttle + DB response cache + dual-UA HTML. | ✅ |
-| **1 — Resilience / anti-bot** | `BrowserFetcher` (crawl4ai) with the retry ladder (transient → egress swap → proxy rotation), Cloudflare/DataDome/429 classifiers, Mihomo proxy client + scoring (disable + reset), egress-IP probe, pluggable captcha-solver hook. Behind the `browser` extra. | ✅ |
-| **2 — Normalization** | HTML/Markdown → LLM-ready text (`clean/markdown.py`). Snapshot storage still 🚧. | markdown ✅ |
+| **1 — Resilience / anti-bot** | `BrowserFetcher` (crawl4ai) with the retry ladder (transient → egress swap → proxy rotation), Cloudflare/DataDome/429 classifiers, Mihomo proxy client + scoring (disable + reset), egress-IP probe, pluggable captcha-solver hook, `link_harvest` DOM link discovery. Behind the `browser` extra. | ✅ |
+| **2 — Normalization** | HTML/Markdown → LLM-ready text (`clean/markdown.py`) + `SnapshotStore` (`{domain}.md`, traversal-safe, prompt-wrap separated from storage). | ✅ |
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
+
+**Directing an assistant to use this?** See [docs/USING-KEEL-CRAWLER.md](docs/USING-KEEL-CRAWLER.md) — a request→wiring playbook with recipes.
 
 ## Install (consumer)
 
 Pin by git tag in `requirements.txt`:
 
 ```
-keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.2.0
+keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.3.0
 # heavy backends are opt-in:
 #   keel-crawler[browser] @ git+...   # crawl4ai + Playwright + lxml
 #   keel-crawler[rss]     @ git+...   # feedparser

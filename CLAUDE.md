@@ -33,7 +33,7 @@ deduped, staged raw item".
 |---|---|---|
 | 0 Fetch | `fetch/client.py` (`HttpFetcher`) | done |
 | 1 Resilience | `antibot/classifiers.py`, `proxy/scores.py` + `proxy/mihomo.py`, `browser/{config,extract,engine}.py`, `captcha.py` | done |
-| 2 Normalize | `clean/markdown.py`; snapshot storage still TODO | markdown done |
+| 2 Normalize | `clean/markdown.py` + `clean/snapshot.py` (`SnapshotStore`, `build_merged_markdown`) | done |
 | 3 Orchestrate | `models.CrawlJob` + `orchestrate.py` (`CrawlSpec`, `run_batch`, transport adapters); `progress.py` | done |
 | 4 RSS | `models.FeedSource`/`FeedItemCandidate` + `rss/{monitor,filters,triage}.py` + `crawler_rss_poll` (behind `[rss]`) | done |
 
@@ -42,9 +42,18 @@ Layer 1 design notes (already applied): the forex `deep_prune` flag became a neu
 side-effects are injected via the `on_result` hook / an injected `MihomoClient` on
 `BrowserFetcher`; `crawler_factory` is injectable so the ladder is testable without
 crawl4ai. Proxy scoring is disable-able (`proxy_scoring_enabled` / env) and
-resettable (`ProxyScoreStore.reset` + `crawler_proxy_scores --reset`). Still TODO:
-snapshot storage (Layer 2), a `link_harvest` DOM-href harvester, and wiring the RSS
-`triage_hook` on the keel-content side.
+resettable (`ProxyScoreStore.reset` + `crawler_proxy_scores --reset`).
+
+Layer 2 snapshot: `clean/snapshot.py` separates storage from prompt-wrapping (the
+forex Gemini prompt Revenika baked into every file is now the caller's optional
+`header`); merge ordering is an injectable `order_key`. Layer 1 `link_harvest`:
+`browser/harvest.py` (DOM-harvest JS hooks + lxml static fallback with an injectable
+`link_match`/`link_deny`); `BrowserFetcher(run_profile="link_harvest")` fills
+`page.discovery_hrefs`.
+
+User playbook: `docs/USING-KEEL-CRAWLER.md`. Remaining ideas: wire the RSS
+`triage_hook` on the keel-content side; a `robots.txt`/politeness gate; optional
+sitemap discovery. See the v0.3.0 sufficiency analysis in the session notes.
 
 ## Extension pattern (mirror keel-seo / keel-content)
 

@@ -145,9 +145,15 @@ def build_run_config(
         kwargs["exclude_all_images"] = True
         kwargs["wait_for_images"] = False
     elif profile == "link_harvest":
+        from keel_crawler.browser.harvest import NAV_EXPAND_JS_AFTER, NAV_EXPAND_JS_BEFORE
+
+        # Keep expanded nav/mega-menu nodes visible for the DOM-harvest hooks.
         kwargs["remove_overlay_elements"] = False
         kwargs["remove_consent_popups"] = False
+        kwargs["simulate_user"] = False
         kwargs["scan_full_page"] = True
         kwargs["scroll_delay"] = 0.22
         kwargs["max_scroll_steps"] = 32
+        kwargs["js_code_before_wait"] = NAV_EXPAND_JS_BEFORE.strip()
+        kwargs["js_code"] = NAV_EXPAND_JS_AFTER.strip()
     return CrawlerRunConfig(**kwargs)
