@@ -26,6 +26,11 @@ also fall back to environment variables — see :mod:`keel_crawler.proxy`.
         "browser_headless": True,
         "browser_channel": "",                  # Playwright channel (e.g. "chrome")
         "captcha_solver": None,                 # dotted path: (url, page) -> CrawledPage | None
+        "fetch": {                              # parallelism + pacing for BrowserFetcher.fetch_many
+            "concurrency": 3,                   # max simultaneous Chromium crawls (raise carefully)
+            "rate_per_minute": 0,               # evenly-spaced global rate (0 = unlimited)
+            "per_host_interval_sec": 4.0,       # politeness gap per hostname
+        },
 
         # --- Layer 3: orchestration ---
         "crawl_job_db_table": "keel_crawler_crawl_job",
@@ -61,6 +66,7 @@ _DEFAULTS = {
     "browser_headless": True,
     "browser_channel": "",
     "captcha_solver": None,
+    "fetch": {},
     # Layer 3
     "crawl_job_db_table": "keel_crawler_crawl_job",
     # Layer 4
@@ -69,7 +75,7 @@ _DEFAULTS = {
 
 # Keys whose default is a dict; ``crawler_subconfig`` returns a copy so callers
 # never mutate the shared default.
-_DICT_KEYS = {"mihomo", "rss"}
+_DICT_KEYS = {"mihomo", "rss", "fetch"}
 
 _RSS_DEFAULTS = {
     "triage_hook": None,
@@ -77,6 +83,12 @@ _RSS_DEFAULTS = {
     "deny_keywords": [],
     "recency_hours": 72,
     "max_items_per_feed": 50,
+}
+
+_FETCH_DEFAULTS = {
+    "concurrency": 3,
+    "rate_per_minute": 0,
+    "per_host_interval_sec": 4.0,
 }
 
 
@@ -96,3 +108,8 @@ def crawler_subconfig(key):
 def rss_setting(key):
     """Return ``KEEL_CRAWLER['rss'][key]`` or the RSS default."""
     return crawler_subconfig("rss").get(key, _RSS_DEFAULTS[key])
+
+
+def fetch_setting(key):
+    """Return ``KEEL_CRAWLER['fetch'][key]`` or the fetch/pacing default."""
+    return crawler_subconfig("fetch").get(key, _FETCH_DEFAULTS[key])

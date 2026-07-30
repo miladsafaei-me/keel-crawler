@@ -17,8 +17,11 @@ lxml is imported lazily so this module loads without the ``[browser]`` extra.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
+
+_HREF_RE = re.compile(r"""(?:href|data-href|data-url)\s*=\s*["']([^"'#]+)["']""", re.IGNORECASE)
 
 # Runs in Playwright after crawl4ai builds the HTML string; page still holds the post-JS DOM.
 DOM_HARVEST_JS = r"""
@@ -133,6 +136,35 @@ def extract_links_from_html(
                 continue
             collected.append(abs_u)
     return dedupe_urls_preserve_order(collected)
+
+
+def extract_hrefs_regex(
+    html: str,
+    base_url: str,
+    *,
+    match: Optional[Callable[[str, str, str], bool]] = None,
+    deny: Optional[Callable[[str], bool]] = None,
+) -> list[str]:
+    """Stdlib-only href extraction (no lxml) — the fallback used by HTTP deep crawl.
+
+    Coarser than :func:`extract_links_from_html` (no anchor text), but dependency-free
+    so link discovery works without the ``[browser]`` extra.
+    """
+    out: list[str] = []
+    for m in _HREF_RE.finditer(html or ""):
+        raw = (m.group(1) or "").strip()
+        if not raw or raw.lower().startswith(("javascript:", "mailto:", "tel:")):
+            continue
+        abs_u = urljoin(base_url, raw)
+        parsed = urlparse(abs_u)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if deny is not None and deny(abs_u):
+            continue
+        if match is not None and not match("", raw, parsed.path or ""):
+            continue
+        out.append(abs_u)
+    return dedupe_urls_preserve_order(out)
 
 
 async def _append_dom_hrefs(page: Any, accum: list[str], seen: set[str]) -> None:

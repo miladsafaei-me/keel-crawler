@@ -3,8 +3,8 @@
 Reusable, **business-blind** web-crawling toolkit for Keel consumer projects —
 extracted from the Revenika / Propopedia / Binarystyle crawlers.
 
-The package is layered so a consumer pulls only what it needs. Layers 0 and 2 ship
-today; the rest land in later versions (see the roadmap).
+The package is layered so a consumer pulls only what it needs — all five layers ship
+today, plus parallel/paced fetching and automatic URL discovery.
 
 | Layer | Concern | Status |
 |---|---|---|
@@ -14,6 +14,11 @@ today; the rest land in later versions (see the roadmap).
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
 
+Cross-cutting: **parallel + paced fetching** (`BrowserFetcher.fetch_many` runs URLs
+concurrently under a `concurrency` cap and an evenly-spaced `rate_per_minute` limiter,
+so a big batch trickles out instead of spiking) and **URL discovery** (`discover.py` —
+sitemap crawling + bounded deep crawl).
+
 **Directing an assistant to use this?** See [docs/USING-KEEL-CRAWLER.md](docs/USING-KEEL-CRAWLER.md) — a request→wiring playbook with recipes.
 
 ## Install (consumer)
@@ -21,7 +26,7 @@ today; the rest land in later versions (see the roadmap).
 Pin by git tag in `requirements.txt`:
 
 ```
-keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.3.0
+keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.4.0
 # heavy backends are opt-in:
 #   keel-crawler[browser] @ git+...   # crawl4ai + Playwright + lxml
 #   keel-crawler[rss]     @ git+...   # feedparser

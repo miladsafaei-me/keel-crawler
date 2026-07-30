@@ -40,6 +40,7 @@ from keel_crawler.browser.harvest import (
     install_discovery_hooks,
     restore_discovery_hooks,
 )
+from keel_crawler.pace import AsyncHostThrottle, AsyncRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,8 @@ class BrowserFetcher:
         rotate_user_agent: bool = True,
         max_proxy_rotations: int = 5,
         same_host_stagger_sec: float = 4.0,
+        concurrency: int = 3,
+        rate_per_minute: float = 0.0,
         egress_store: EgressPreferenceStore | None = None,
         on_result: Optional[Callable[[bool, bool], None]] = None,
         crawler_factory: Optional[Callable[[Any], Any]] = None,
@@ -198,6 +201,11 @@ class BrowserFetcher:
         self._rotate_ua = bool(rotate_user_agent)
         self._max_rotations = max(0, int(max_proxy_rotations))
         self._stagger = max(0.0, float(same_host_stagger_sec))
+        # Parallelism + pacing: cap simultaneous crawls, and (optionally) spread the
+        # start of each unit of work evenly so token spend doesn't spike.
+        self._concurrency = max(1, int(concurrency))
+        self._rate = AsyncRateLimiter(rate_per_minute)
+        self._host_throttle = AsyncHostThrottle(self._stagger)
         self._egress = egress_store or EgressPreferenceStore()
         self._on_result = on_result
         self._crawler_factory = crawler_factory or self._default_crawler_factory
@@ -213,6 +221,8 @@ class BrowserFetcher:
         from keel_crawler.config import crawler_setting
         from keel_crawler.proxy.mihomo import mihomo_from_config
 
+        from keel_crawler.config import fetch_setting
+
         proxy_url = (crawler_setting("proxy_url") or os.environ.get("LOCAL_PROXY_URL") or "").strip()
         mihomo = mihomo_from_config()
         kwargs: dict[str, Any] = {
@@ -220,6 +230,9 @@ class BrowserFetcher:
             "mihomo": mihomo if mihomo.is_configured() else None,
             "headless": bool(crawler_setting("browser_headless")),
             "channel": crawler_setting("browser_channel") or "",
+            "concurrency": int(fetch_setting("concurrency")),
+            "rate_per_minute": float(fetch_setting("rate_per_minute")),
+            "same_host_stagger_sec": float(fetch_setting("per_host_interval_sec")),
         }
         kwargs.update(overrides)
         return cls(**kwargs)
@@ -426,18 +439,25 @@ class BrowserFetcher:
         return await self._maybe_solve_captcha(url, page)
 
     async def afetch_many(self, urls: list[str]) -> list[CrawledPage]:
-        out: list[CrawledPage] = []
-        prev_host = ""
-        for u in urls:
-            host = _hostname(u)
-            if self._stagger > 0 and prev_host and prev_host == host:
-                await asyncio.sleep(self._stagger)
-            try:
-                out.append(await self.afetch_one(u))
-            except Exception as exc:
-                out.append(CrawledPage(url=u, text="", error=str(exc)))
-            prev_host = host
-        return out
+        """Crawl URLs concurrently (bounded by ``concurrency``), paced by the rate
+        limiter, and polite per host. Results preserve input order.
+        """
+        if not urls:
+            return []
+        sem = asyncio.Semaphore(self._concurrency)
+
+        async def worker(u: str) -> CrawledPage:
+            async with sem:
+                # Pace the START of each unit of work so a big batch trickles out
+                # instead of bursting; then respect per-host politeness.
+                await self._rate.acquire()
+                await self._host_throttle.wait(u)
+                try:
+                    return await self.afetch_one(u)
+                except Exception as exc:
+                    return CrawledPage(url=u, text="", error=str(exc))
+
+        return await asyncio.gather(*(worker(u) for u in urls))
 
     def fetch_one(self, url: str) -> CrawledPage:
         """Sync wrapper around :meth:`afetch_one` (opens its own event loop)."""

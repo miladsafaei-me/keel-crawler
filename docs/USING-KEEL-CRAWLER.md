@@ -37,6 +37,11 @@ Phrase the *goal*; the assistant picks the layer. Useful requests:
   selection (that hook lives in keel-content).
 - **"Harvest all the menu/nav links from this site."**
   → `BrowserFetcher(run_profile="link_harvest")` → `page.discovery_hrefs`.
+- **"Find every URL on this site"** / **"discover the pages to crawl."**
+  → `discover_sitemap_urls(...)` (from the sitemap) and/or `deep_crawl(...)` (follow links).
+- **"Crawl these 500 pages but don't blow the budget in one go — spread it out."**
+  → `BrowserFetcher.fetch_many(...)` with a `concurrency` cap + `rate_per_minute`
+  limiter that trickles the work out evenly over time. Raise the numbers to go faster.
 - **"The proxy scores look off — reset them"** / **"stop scoring proxies."**
   → `crawler_proxy_scores --reset`, or set `proxy_scoring_enabled=False`.
 
@@ -48,7 +53,7 @@ only to force a choice (e.g. "use the cheap HTTP fetcher, don't launch a browser
 `requirements.txt`:
 
 ```
-keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.3.0
+keel-crawler @ git+https://github.com/miladsafaei-me/keel-crawler@v0.4.0
 # opt-in heavy backends:
 #   keel-crawler[browser] @ git+...   # crawl4ai + Playwright + lxml
 #   keel-crawler[rss]     @ git+...   # feedparser
@@ -74,8 +79,16 @@ KEEL_CRAWLER = {
 
     # RSS: the LLM "is this newsworthy?" hook (lives in keel-content)
     "rss": {"triage_hook": "myapp.news.triage", "recency_hours": 72},
+
+    # parallel + paced browser fetching (spread token spend over the day)
+    "fetch": {"concurrency": 3, "rate_per_minute": 20, "per_host_interval_sec": 4.0},
 }
 ```
+
+**Pacing knobs** — `concurrency` caps simultaneous Chromium crawls (each is heavy;
+2–4 is sane). `rate_per_minute` evenly spaces the *start* of each page so a 500-URL
+batch trickles out (e.g. `20` → one every 3s → ~28k/day) instead of bursting; `0`
+disables pacing. To speed up later, just raise these numbers.
 
 ## Recipes
 
@@ -147,6 +160,45 @@ fetcher = BrowserFetcher(run_profile="link_harvest",
                          link_match=my_partner_filter)   # optional relevance filter
 page = fetcher.fetch_one("https://broker.com/")
 nav_and_footer_links = page.discovery_hrefs
+```
+
+### 6. Parallel + paced batch (Layer 1)
+
+```python
+# Reads concurrency / rate_per_minute / per_host_interval_sec from KEEL_CRAWLER["fetch"]:
+fetcher = BrowserFetcher.from_config()
+pages = fetcher.fetch_many(list_of_500_urls)   # concurrent, capped, paced, order preserved
+# or override inline:
+fetcher = BrowserFetcher.from_config(concurrency=4, rate_per_minute=30)
+```
+
+### 7. URL discovery — sitemap + deep crawl
+
+```python
+from keel_crawler import HttpFetcher
+from keel_crawler.discover import (
+    discover_sitemap_urls, deep_crawl, http_link_fetcher, browser_link_fetcher,
+)
+
+http = HttpFetcher()
+# a) from the sitemap (robots.txt -> sitemap index -> child sitemaps; handles .gz):
+urls = discover_sitemap_urls("https://broker.com/", http_fetcher=http,
+                             include=lambda u: "/education/" in u)
+
+# b) by following links (breadth-first, same-domain, bounded):
+urls = deep_crawl(["https://broker.com/"],
+                  fetch_links=http_link_fetcher(http),   # cheap HTTP+regex
+                  max_pages=200, max_depth=2)
+# JS-rendered nav? use the browser link harvester instead:
+#   fetch_links=browser_link_fetcher(BrowserFetcher.from_config(run_profile="link_harvest"))
+```
+
+Or the command:
+
+```bash
+python manage.py crawler_discover https://broker.com/ --sitemap
+python manage.py crawler_discover https://broker.com/ --deep --depth 2 --max 100
+python manage.py crawler_discover https://broker.com/ --deep --browser   # JS nav
 ```
 
 ## Proxy operations

@@ -20,6 +20,7 @@ _ALLOWED_KEYS = {
     "browser_headless",
     "browser_channel",
     "captcha_solver",
+    "fetch",
     # Layer 3
     "crawl_job_db_table",
     # Layer 4
@@ -33,6 +34,8 @@ _ALLOWED_RSS_KEYS = {
     "recency_hours",
     "max_items_per_feed",
 }
+
+_ALLOWED_FETCH_KEYS = {"concurrency", "rate_per_minute", "per_host_interval_sec"}
 
 
 @register()
@@ -53,7 +56,7 @@ def check_keel_crawler_config(app_configs, **kwargs):
                 id="keel_crawler.E002",
             )
         )
-    for dict_key in ("mihomo", "rss"):
+    for dict_key in ("mihomo", "rss", "fetch"):
         if dict_key in cfg and not isinstance(cfg[dict_key], dict):
             errors.append(
                 Error(f"KEEL_CRAWLER['{dict_key}'] must be a dict.", id="keel_crawler.E003")
@@ -67,6 +70,17 @@ def check_keel_crawler_config(app_configs, **kwargs):
                     f"KEEL_CRAWLER['rss'] has unknown key(s): {sorted(unknown_rss)}.",
                     hint=f"Allowed keys: {sorted(_ALLOWED_RSS_KEYS)}.",
                     id="keel_crawler.E004",
+                )
+            )
+    fetch = cfg.get("fetch")
+    if isinstance(fetch, dict):
+        unknown_fetch = set(fetch) - _ALLOWED_FETCH_KEYS
+        if unknown_fetch:
+            errors.append(
+                Error(
+                    f"KEEL_CRAWLER['fetch'] has unknown key(s): {sorted(unknown_fetch)}.",
+                    hint=f"Allowed keys: {sorted(_ALLOWED_FETCH_KEYS)}.",
+                    id="keel_crawler.E005",
                 )
             )
     return errors

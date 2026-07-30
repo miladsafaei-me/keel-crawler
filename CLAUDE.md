@@ -51,9 +51,16 @@ forex Gemini prompt Revenika baked into every file is now the caller's optional
 `link_match`/`link_deny`); `BrowserFetcher(run_profile="link_harvest")` fills
 `page.discovery_hrefs`.
 
+Cross-cutting (v0.4.0): `pace.py` (`AsyncRateLimiter` evenly-spaced global rate +
+`AsyncHostThrottle`) powers a **parallel** `BrowserFetcher.fetch_many` — bounded by
+`concurrency`, paced by `rate_per_minute`, polite per host, order-preserving; all from
+`KEEL_CRAWLER["fetch"]`. `discover.py` does **URL discovery**: `discover_sitemap_urls`
+(robots → sitemap index → children, gz-aware) and `deep_crawl` (BFS link-follow with
+`http_link_fetcher`/`browser_link_fetcher` adapters); `crawler_discover` command.
+
 User playbook: `docs/USING-KEEL-CRAWLER.md`. Remaining ideas: wire the RSS
-`triage_hook` on the keel-content side; a `robots.txt`/politeness gate; optional
-sitemap discovery. See the v0.3.0 sufficiency analysis in the session notes.
+`triage_hook` on the keel-content side; a `robots.txt` disallow/politeness gate for
+fetches (discovery already reads robots for sitemaps); observability/metrics.
 
 ## Extension pattern (mirror keel-seo / keel-content)
 
