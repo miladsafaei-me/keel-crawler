@@ -32,7 +32,10 @@ def estimate_visible_text_len(html: str) -> int:
     """Rough count of visible characters in ``html`` (strip script/style + tags).
 
     Dependency-free and deliberately coarse — it only needs to separate a real
-    article from an almost-empty JS shell, not to extract content.
+    article from an almost-empty JS shell, not to extract content. Retained for
+    ``[browser]``-free hosts and custom ``needs_browser`` predicates; the default
+    path now derives the same floor from the single lxml parse it already does for
+    extraction (see :meth:`HybridFetcher._assess`), so it no longer calls this.
     """
     if not html:
         return 0
@@ -94,6 +97,28 @@ class HybridFetcher:
             return True
         return False
 
+    def _assess(self, url: str, html: str | None, final_url: str | None) -> tuple[Any, bool]:
+        """Decide escalation and (when it can) produce the page from ONE parse.
+
+        Returns ``(page_or_None, needs_browser)``. The page is returned even when
+        escalating so a browser-less fallback can reuse it without re-parsing. A custom
+        ``needs_browser`` predicate keeps the original ``(html, final_url)`` contract and
+        pays a separate parse; the default path parses once and reads the JS-shell floor
+        off the extracted page — no second full-page scan.
+        """
+        if not html or not html.strip():
+            return None, True
+        if self._needs_browser is not self._default_needs_browser:
+            if self._needs_browser(html, final_url or url):
+                return None, True
+            return self._page_from_html(url, html, final_url), False
+        if looks_like_cloudflare_interstitial(html):
+            return None, True
+        from keel_crawler.browser.extract import page_and_visible_len_from_html
+
+        page, visible_len = page_and_visible_len_from_html(url, html or "", final_url or "")
+        return page, (visible_len < self._min_text)
+
     def _ensure_browser(self) -> Any:
         if self._browser is not None:
             return self._browser
@@ -112,16 +137,17 @@ class HybridFetcher:
         html, final_url = self._http.get_html_document_with_final_url(
             url, timeout=self._http_timeout
         )
-        if html and not self._needs_browser(html, final_url or url):
+        page, needs = self._assess(url, html, final_url)
+        if not needs:
             self.http_served += 1
-            return self._page_from_html(url, html, final_url)
+            return page if page is not None else self._page_from_html(url, html or "", final_url)
         browser = self._ensure_browser()
         if browser is not None:
             self.browser_escalated += 1
             return browser.fetch_one(url)
         # No browser available: return the best-effort cheap page (may be thin/empty).
         self.http_served += 1
-        return self._page_from_html(url, html or "", final_url)
+        return page if page is not None else self._page_from_html(url, html or "", final_url)
 
     def fetch_many(self, urls: list[str]) -> list[Any]:
         """Fetch many URLs: cheap HTTP concurrently, then one browser batch for the
@@ -136,11 +162,17 @@ class HybridFetcher:
         )
         results: list[Any] = [None] * len(urls)
         escalate_idx: list[int] = []
+        # Pages already parsed by _assess for escalation candidates — reused as the
+        # browser-less fallback so we never parse the same HTML twice.
+        fallback_pages: dict[int, Any] = {}
         for i, (u, (html, final_url)) in enumerate(zip(urls, pairs)):
-            if html and not self._needs_browser(html, final_url or u):
-                results[i] = self._page_from_html(u, html, final_url)
+            page, needs = self._assess(u, html, final_url)
+            if not needs:
+                results[i] = page if page is not None else self._page_from_html(u, html or "", final_url)
             else:
                 escalate_idx.append(i)
+                if page is not None:
+                    fallback_pages[i] = page
 
         self.http_served += len(urls) - len(escalate_idx)
 
@@ -160,7 +192,9 @@ class HybridFetcher:
                 self.http_served += len(escalate_idx)
                 for i in escalate_idx:
                     html, final_url = pairs[i]
-                    results[i] = self._page_from_html(urls[i], html or "", final_url)
+                    results[i] = fallback_pages.get(i) or self._page_from_html(
+                        urls[i], html or "", final_url
+                    )
 
         return results
 

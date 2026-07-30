@@ -100,6 +100,7 @@ def poll_feeds(
         prefetched = [text for text, _ in http_fetcher.fetch_many([s.url for s in sources], mode="text")]
 
     stats = {"feeds": 0, "new_items": 0, "seen_items": 0, "errors": 0}
+    polled_at = timezone.now()
     for idx, source in enumerate(sources):
         stats["feeds"] += 1
         status = "ok"
@@ -120,7 +121,13 @@ def poll_feeds(
             stats["errors"] += 1
             status = f"error: {exc}"[:200]
             logger.warning("poll_feeds: %s failed: %s", source.url, exc)
-        source.last_polled_at = timezone.now()
+        source.last_polled_at = polled_at
         source.last_status = status
-        source.save(update_fields=["last_polled_at", "last_status", "updated_at"])
+        source.updated_at = polled_at  # bulk_update does not fire auto_now
+
+    # One UPDATE for the whole watchlist instead of one per feed.
+    if sources:
+        FeedSource.objects.bulk_update(
+            sources, ["last_polled_at", "last_status", "updated_at"], batch_size=500
+        )
     return stats

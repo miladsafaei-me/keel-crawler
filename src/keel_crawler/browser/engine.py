@@ -355,6 +355,10 @@ class BrowserFetcher:
             free = self._free_crawlers.setdefault(key, [])
             if free:
                 return free.pop()
+        # The UA is chosen once, when this pooled crawler is built — so within a batch a
+        # reused crawler keeps one UA rather than rotating per URL. That is the accepted
+        # cost of pooling; disable pooling (or lower reuse) if per-URL UA entropy matters
+        # more than avoiding a Chromium relaunch per page.
         crawler = self._crawler_factory(self._browser_config(force_proxy=force_proxy))
         await crawler.__aenter__()
         async with self._pool_lock:
@@ -502,24 +506,38 @@ class BrowserFetcher:
         """
         if not urls:
             return []
-        sem = asyncio.Semaphore(self._concurrency)
+        # A fixed pool of ``concurrency`` workers draining a queue, rather than one
+        # coroutine per URL bounded by a semaphore: a very large batch no longer
+        # materializes N live coroutine frames up front. Results are written by index so
+        # input order is preserved. Pacing (global rate) and per-host politeness still
+        # gate the start of each unit of work.
+        results: list[CrawledPage] = [
+            CrawledPage(url=u, text="", error="not fetched") for u in urls
+        ]
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for i in range(len(urls)):
+            queue.put_nowait(i)
 
-        async def worker(u: str) -> CrawledPage:
-            # Pace the START of each unit of work (global spacing) and respect per-host
-            # politeness BEFORE taking a concurrency slot — a worker sleeping for
-            # politeness must not occupy one of the limited browser slots.
-            await self._rate.acquire()
-            await self._host_throttle.wait(u)
-            async with sem:
+        async def worker() -> None:
+            while True:
                 try:
-                    return await self.afetch_one(u)
+                    i = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                u = urls[i]
+                await self._rate.acquire()
+                await self._host_throttle.wait(u)
+                try:
+                    results[i] = await self.afetch_one(u)
                 except Exception as exc:
-                    return CrawledPage(url=u, text="", error=str(exc))
+                    results[i] = CrawledPage(url=u, text="", error=str(exc))
 
+        n = min(self._concurrency, len(urls))
         try:
-            return await asyncio.gather(*(worker(u) for u in urls))
+            await asyncio.gather(*(worker() for _ in range(n)))
         finally:
             await self._close_pool()
+        return results
 
     def fetch_one(self, url: str) -> CrawledPage:
         """Sync wrapper around :meth:`afetch_one` (opens its own event loop)."""

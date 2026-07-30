@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -60,13 +61,23 @@ class HttpFetcher:
         max_body_chars: int = 1_500_000,
         enable_cache: bool = True,
         l1_max_entries: int = 8192,
+        l1_max_bytes: int = 256 * 1024 * 1024,
         pool_maxsize: int = 16,
+        max_download_bytes: int = 16 * 1024 * 1024,
+        transient_retries: int = 1,
     ) -> None:
         if cache_ttl_seconds is None:
             cache_ttl_seconds = int(crawler_setting("cache_ttl_seconds"))
         self._ttl = max(60, int(cache_ttl_seconds))
         self._enable = enable_cache
         self._max_body = max(1_000, int(max_body_chars))
+        # Hard ceiling on how many bytes a single response body is read into memory,
+        # BEFORE the char-based ``max_body`` truncation. Without it a pathological or
+        # hostile URL (a 500 MB "page") would be fully downloaded and decoded.
+        self._max_download = max(64 * 1024, int(max_download_bytes))
+        # One cheap retry for transient network failures on the HTTP path keeps a
+        # momentary reset/timeout from needlessly escalating a page to the browser.
+        self._transient_retries = max(0, int(transient_retries))
         self._session = requests.Session()
         # Size the urllib3 connection pool for concurrent fetch_many: the default of
         # 10 would otherwise serialize connections once more than 10 threads run.
@@ -77,11 +88,16 @@ class HttpFetcher:
         self._throttle = HostThrottle(min_interval_per_host)
         self.requests_made = 0
         self.cache_hits = 0
-        # Guards the L1 OrderedDict and the two counters so ``fetch_many`` can drive
-        # the shared fetcher from several threads without corrupting the cache.
+        # Guards the L1 OrderedDict, its byte tally, and the two counters so
+        # ``fetch_many`` can drive the shared fetcher from several threads without
+        # corrupting the cache.
         self._lock = threading.Lock()
         self._l1_max = max(256, int(l1_max_entries))
+        # Bound the L1 cache by total body bytes as well as entry count: 8192 entries
+        # at ~1.5 MB each could otherwise pin gigabytes for one long crawl.
+        self._l1_max_bytes = max(16 * 1024 * 1024, int(l1_max_bytes))
         self._l1: OrderedDict[str, _L1Entry] = OrderedDict()
+        self._l1_bytes = 0
         # Negative cache TTL (permanent 404/410 only): capped so a page that later
         # comes back is re-checked within the hour rather than the full body TTL.
         self._neg_ttl = min(self._ttl, 3600)
@@ -114,16 +130,26 @@ class HttpFetcher:
                 return None
             if entry.expires_at <= now:
                 del self._l1[key]
+                self._l1_bytes -= len(entry.body_text)
                 return None
             self._l1.move_to_end(key)
             return entry
 
     def _l1_put(self, key: str, entry: _L1Entry) -> None:
         with self._lock:
+            old = self._l1.get(key)
+            if old is not None:
+                self._l1_bytes -= len(old.body_text)
             self._l1[key] = entry
             self._l1.move_to_end(key)
-            while len(self._l1) > self._l1_max:
-                self._l1.popitem(last=False)
+            self._l1_bytes += len(entry.body_text)
+            # Evict least-recently-used entries until both bounds hold. Keep at least
+            # the just-inserted entry so a single oversized body never empties the cache.
+            while len(self._l1) > 1 and (
+                len(self._l1) > self._l1_max or self._l1_bytes > self._l1_max_bytes
+            ):
+                _k, evicted = self._l1.popitem(last=False)
+                self._l1_bytes -= len(evicted.body_text)
 
     def _l1_negative_hit(self, l1: _L1Entry | None) -> bool:
         """A fresh, non-200 L1 entry marks a URL as known-dead — skip the refetch."""
@@ -264,6 +290,35 @@ class HttpFetcher:
                 },
             )
 
+    def _consume_capped(self, r: requests.Response) -> bool:
+        """Read at most ``max_download_bytes`` of a *streamed* response into ``r``.
+
+        Streaming + a byte ceiling means a huge/hostile body can't exhaust memory: we
+        stop reading past the cap and let the normal ``.text``/``.content`` decoding run
+        over what we kept. Returns True if the body was truncated at the cap.
+        """
+        total = 0
+        chunks: list[bytes] = []
+        truncated = False
+        try:
+            for chunk in r.iter_content(chunk_size=65_536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= self._max_download:
+                    truncated = True
+                    break
+        except requests.RequestException:
+            # A mid-stream read error yields what we have so far (possibly empty).
+            pass
+        r._content = b"".join(chunks)
+        r._content_consumed = True
+        return truncated
+
+    # Retriable HTTP status codes on the cheap path (transient server/limit states).
+    _RETRIABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
     def _request_once(
         self,
         url: str,
@@ -274,27 +329,43 @@ class HttpFetcher:
         key, host = normalize_request_url(url)
         if not host:
             return None
-        self._throttle.wait(host)
-        try:
-            r = self._session.get(url, timeout=timeout, headers=headers, allow_redirects=True)
-        except requests.RequestException as exc:
-            logger.debug("crawl get %s: %s", url, exc)
-            return None
-        self._bump_requests()
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as exc:
-            resp = exc.response
-            code = resp.status_code if resp is not None else 0
-            logger.debug("crawl get %s HTTP %s", url, code)
-            self._remember_dead(key, code)
-            return None
-        text = r.text or ""
-        final = str(r.url)
-        hdrs = {str(k): str(v) for k, v in r.headers.items()}
-        return _Fetched(
-            text=text, final_url=final, status_code=r.status_code, headers=hdrs
-        )
+        for attempt in range(self._transient_retries + 1):
+            last = attempt >= self._transient_retries
+            self._throttle.wait(host)
+            try:
+                r = self._session.get(
+                    url, timeout=timeout, headers=headers, allow_redirects=True, stream=True
+                )
+            except requests.RequestException as exc:
+                logger.debug("crawl get %s: %s", url, exc)
+                if last:
+                    return None
+                time.sleep(min(1.5 * (attempt + 1), 3.0))
+                continue
+            self._bump_requests()
+            try:
+                r.raise_for_status()
+            except requests.HTTPError as exc:
+                resp = exc.response
+                code = resp.status_code if resp is not None else 0
+                r.close()
+                logger.debug("crawl get %s HTTP %s", url, code)
+                if code in (404, 410):
+                    self._remember_dead(key, code)
+                    return None
+                if code in self._RETRIABLE_STATUS and not last:
+                    time.sleep(min(1.5 * (attempt + 1), 3.0))
+                    continue
+                return None
+            self._consume_capped(r)
+            text = r.text or ""
+            final = str(r.url)
+            hdrs = {str(k): str(v) for k, v in r.headers.items()}
+            r.close()
+            return _Fetched(
+                text=text, final_url=final, status_code=r.status_code, headers=hdrs
+            )
+        return None
 
     def throttled_get(
         self,
@@ -302,21 +373,43 @@ class HttpFetcher:
         *,
         timeout: int,
         headers: dict[str, str],
+        max_bytes: int | None = None,
     ) -> requests.Response | None:
         """
         Single GET with session + per-host throttle only (no L1/DB cache).
         For binary responses, logos, or HTML that should not share the text cache.
+
+        The body is streamed and capped (``max_bytes``, default 64 MiB — generous
+        enough for a large uncompressed sitemap) so a runaway response can't exhaust
+        memory. Callers read ``.content``/``.text`` as usual.
         """
         _, host = normalize_request_url(url)
         if not host:
             return None
+        cap = max(64 * 1024, int(max_bytes)) if max_bytes is not None else 64 * 1024 * 1024
         self._throttle.wait(host)
         try:
-            r = self._session.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+            r = self._session.get(
+                url, timeout=timeout, headers=headers, allow_redirects=True, stream=True
+            )
         except requests.RequestException as exc:
             logger.debug("crawl throttled_get %s: %s", url, exc)
             return None
         self._bump_requests()
+        total = 0
+        chunks: list[bytes] = []
+        try:
+            for chunk in r.iter_content(chunk_size=65_536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= cap:
+                    break
+        except requests.RequestException as exc:
+            logger.debug("crawl throttled_get %s read: %s", url, exc)
+        r._content = b"".join(chunks)
+        r._content_consumed = True
         return r
 
     def _serve_from_row(self, key: str, row: CrawlHttpCache) -> _Fetched:
@@ -337,6 +430,21 @@ class HttpFetcher:
             status_code=200,
             headers=dict(row.headers_json or {}),
         )
+
+    def _touch_cache_ttl(self, key: str, row: CrawlHttpCache) -> _Fetched:
+        """A 304 means the stored body is still current — refresh only its TTL.
+
+        Re-running the full ``_write_cache`` here would re-ship the (possibly
+        multi-hundred-KB) body to the DB and recompute its SHA on every revalidation,
+        which defeats the point of the conditional GET. Instead we bump ``expires_at``
+        with a single narrow UPDATE and mutate the in-memory row so the L1 re-seed
+        (via :meth:`_serve_from_row`) carries the *new* expiry, not the stale one.
+        """
+        exp = timezone.now() + timedelta(seconds=self._ttl)
+        row.expires_at = exp
+        if self._enable:
+            CrawlHttpCache.objects.filter(normalized_url=key).update(expires_at=exp)
+        return self._serve_from_row(key, row)
 
     def _get_cached(
         self,
@@ -391,19 +499,13 @@ class HttpFetcher:
             if fetched is None:
                 continue
             if fetched.status_code == 304 and row is not None:
-                # Unchanged since the cached copy — refresh its TTL and serve the stored
-                # body without paying to re-download it.
-                self._write_cache(
-                    key=key,
-                    hostname=host,
-                    status_code=200,
-                    final_url=row.final_url or key,
-                    headers=dict(row.headers_json or {}),
-                    text=row.body_text or "",
-                )
+                # Unchanged since the cached copy — refresh only the TTL and serve the
+                # stored body; the conditional GET already avoided the re-download, and
+                # this avoids re-writing the body back to the DB too.
+                served = self._touch_cache_ttl(key, row)
                 if require_html and not self._is_html(row.headers_json or {}):
                     return None
-                return self._serve_from_row(key, row)
+                return served
             if fetched.status_code == 200:
                 # Cache every 200 (even non-HTML) so a later fetch short-circuits.
                 self._write_cache(
