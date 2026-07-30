@@ -26,6 +26,9 @@ class CrawledPage:
     egress_proxy: bool | None = None
     egress_ip: str = ""
     discovery_hrefs: list[str] = field(default_factory=list)
+    # Number of fetch attempts made for this page inside the last browser session
+    # (the transient-retry ladder). 1 = succeeded/failed on the first try.
+    attempts: int = 1
 
     def ok(self) -> bool:
         return not (self.error or "").strip() and bool((self.text or "").strip())

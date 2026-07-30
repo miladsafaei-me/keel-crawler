@@ -13,15 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from urllib.parse import urlparse
 
-
-def _hostname(url: str) -> str:
-    try:
-        host = (urlparse((url or "").strip()).netloc or "").lower()
-    except Exception:
-        host = ""
-    return host[4:] if host.startswith("www.") else host
+from keel_crawler.normalize import hostname_of
 
 
 class AsyncRateLimiter:
@@ -58,17 +51,27 @@ class AsyncRateLimiter:
 class AsyncHostThrottle:
     """Minimum interval between requests to the same hostname (async, per-host lock)."""
 
+    _MAX_TRACKED_HOSTS = 8192
+
     def __init__(self, min_interval_seconds: float = 0.0) -> None:
         self._min = max(0.0, float(min_interval_seconds))
         self._locks: dict[str, asyncio.Lock] = {}
         self._last: dict[str, float] = {}
 
+    def _prune(self) -> None:
+        keep = sorted(self._last.items(), key=lambda kv: kv[1])[len(self._last) // 2 :]
+        keep_hosts = {h for h, _ in keep}
+        self._last = dict(keep)
+        self._locks = {h: lk for h, lk in self._locks.items() if h in keep_hosts}
+
     async def wait(self, url: str) -> None:
         if self._min <= 0:
             return
-        host = _hostname(url)
+        host = hostname_of(url)
         if not host:
             return
+        if host not in self._locks and len(self._locks) >= self._MAX_TRACKED_HOSTS:
+            self._prune()
         lock = self._locks.setdefault(host, asyncio.Lock())
         async with lock:
             now = time.monotonic()

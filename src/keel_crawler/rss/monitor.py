@@ -35,27 +35,42 @@ def _entry_guid(entry: Any) -> str:
     return guid[:800]
 
 
-def _stage_entry(source: FeedSource, entry: Any) -> bool:
-    """Create one candidate if unseen. Returns True when a new row was created."""
-    guid = _entry_guid(entry)
-    if not guid:
-        return False
+def _build_candidate(source: FeedSource, entry: Any, guid: str) -> FeedItemCandidate:
+    """Build (unsaved) a candidate row from a feed entry."""
     summary = (entry.get("summary") or entry.get("description") or "").strip()
-    _, created = FeedItemCandidate.objects.get_or_create(
+    return FeedItemCandidate(
         guid=guid,
-        defaults={
-            "source": source,
-            "title": (entry.get("title") or "").strip()[:500],
-            "link": (entry.get("link") or "").strip()[:1000],
-            "summary": summary,
-            "author": (entry.get("author") or "").strip()[:200],
-            "published_at": _parse_published(entry),
-            "raw": {
-                "tags": [t.get("term") for t in (entry.get("tags") or []) if t.get("term")],
-            },
-        },
+        source=source,
+        title=(entry.get("title") or "").strip()[:500],
+        link=(entry.get("link") or "").strip()[:1000],
+        summary=summary,
+        author=(entry.get("author") or "").strip()[:200],
+        published_at=_parse_published(entry),
+        raw={"tags": [t.get("term") for t in (entry.get("tags") or []) if t.get("term")]},
     )
-    return created
+
+
+def _stage_entries(source: FeedSource, entries: list[Any]) -> int:
+    """Stage all unseen entries for one feed in a single query + one bulk insert.
+
+    Replaces the per-entry ``get_or_create`` (N selects + N inserts) with one
+    ``guid__in`` lookup and one ``bulk_create``. ``ignore_conflicts`` absorbs the
+    race where a concurrent poll inserts the same guid between the lookup and write.
+    """
+    by_guid: dict[str, FeedItemCandidate] = {}
+    for entry in entries:
+        guid = _entry_guid(entry)
+        if guid and guid not in by_guid:  # first spelling wins within one feed
+            by_guid[guid] = _build_candidate(source, entry, guid)
+    if not by_guid:
+        return 0
+    existing = set(
+        FeedItemCandidate.objects.filter(guid__in=list(by_guid)).values_list("guid", flat=True)
+    )
+    fresh = [cand for guid, cand in by_guid.items() if guid not in existing]
+    if fresh:
+        FeedItemCandidate.objects.bulk_create(fresh, ignore_conflicts=True, batch_size=500)
+    return len(fresh)
 
 
 def poll_feeds(
@@ -87,11 +102,9 @@ def poll_feeds(
             else:
                 parsed = feedparser.parse(source.url)
             entries = list(parsed.entries or [])[: max(0, cap)]
-            for entry in entries:
-                if _stage_entry(source, entry):
-                    stats["new_items"] += 1
-                else:
-                    stats["seen_items"] += 1
+            new_count = _stage_entries(source, entries)
+            stats["new_items"] += new_count
+            stats["seen_items"] += max(0, len(entries) - new_count)
             if getattr(parsed, "bozo", 0) and not entries:
                 status = f"parse warning: {getattr(parsed, 'bozo_exception', '')}"[:200]
         except Exception as exc:

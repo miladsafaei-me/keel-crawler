@@ -69,6 +69,9 @@ class HttpFetcher:
         self.cache_hits = 0
         self._l1_max = max(256, int(l1_max_entries))
         self._l1: OrderedDict[str, _L1Entry] = OrderedDict()
+        # Negative cache TTL (permanent 404/410 only): capped so a page that later
+        # comes back is re-checked within the hour rather than the full body TTL.
+        self._neg_ttl = min(self._ttl, 3600)
 
     def metrics(self) -> dict[str, int]:
         return {"http_requests": self.requests_made, "http_cache_hits": self.cache_hits}
@@ -97,6 +100,30 @@ class HttpFetcher:
         self._l1.move_to_end(key)
         while len(self._l1) > self._l1_max:
             self._l1.popitem(last=False)
+
+    def _l1_negative_hit(self, l1: _L1Entry | None) -> bool:
+        """A fresh, non-200 L1 entry marks a URL as known-dead — skip the refetch."""
+        return l1 is not None and l1.status_code != 200
+
+    def _remember_dead(self, key: str, code: int) -> None:
+        """In-process negative cache for permanent HTTP failures (404/410 only).
+
+        Transient errors (timeouts, 5xx, connection resets) are never cached — they
+        must be retried. Only definitively-gone resources are remembered, L1-only, so
+        a batch that references the same dead URL many times fetches it once.
+        """
+        if code not in (404, 410) or not key:
+            return
+        self._l1_put(
+            key,
+            _L1Entry(
+                expires_at=timezone.now() + timedelta(seconds=self._neg_ttl),
+                body_text="",
+                headers_json={},
+                status_code=code,
+                final_url="",
+            ),
+        )
 
     def _load_cache_row(self, key: str) -> CrawlHttpCache | None:
         if not self._enable:
@@ -179,6 +206,7 @@ class HttpFetcher:
             resp = exc.response
             code = resp.status_code if resp is not None else 0
             logger.debug("crawl get %s HTTP %s", url, code)
+            self._remember_dead(key, code)
             return None
         text = r.text or ""
         final = str(r.url)
@@ -215,6 +243,8 @@ class HttpFetcher:
         if not key or not host:
             return None
         l1 = self._l1_pop_stale(key)
+        if self._l1_negative_hit(l1):
+            return None
         if l1 is not None and l1.status_code == 200:
             self.cache_hits += 1
             return l1.body_text or None
@@ -251,6 +281,8 @@ class HttpFetcher:
         if not key or not host:
             return None
         l1 = self._l1_pop_stale(key)
+        if self._l1_negative_hit(l1):
+            return None
         if l1 is not None and l1.status_code == 200:
             ct = str((l1.headers_json or {}).get("Content-Type", "")).lower()
             if "html" in ct:
@@ -311,6 +343,8 @@ class HttpFetcher:
         if not key or not host:
             return None, None
         l1 = self._l1_pop_stale(key)
+        if self._l1_negative_hit(l1):
+            return None, None
         if l1 is not None and l1.status_code == 200:
             ct = str((l1.headers_json or {}).get("Content-Type", "")).lower()
             if "html" in ct:

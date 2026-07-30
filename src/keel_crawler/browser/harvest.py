@@ -70,6 +70,29 @@ document.querySelectorAll('button.nav-item[aria-expanded="false"]').forEach(_cli
 """
 
 
+def canonical_url_key(url: str) -> str:
+    """Scheme/www/trailing-slash-insensitive identity key for one URL.
+
+    Two URLs that differ only by ``www.``, a trailing slash, or ``http`` vs ``https``
+    collapse to the same key. Shared by :func:`dedupe_urls_preserve_order` and the
+    deep-crawl visited-set so both agree on what "the same page" means.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = p.path or "/"
+        if path != "/" and path.endswith("/"):
+            path = path[:-1]
+        return f"https://{host}{path}" + (f"?{p.query}" if p.query else "")
+    except Exception:
+        return u.lower()
+
+
 def dedupe_urls_preserve_order(urls: list[str]) -> list[str]:
     """Collapse equivalent URLs (www, trailing slash, http/https) keeping first spelling."""
     seen: set[str] = set()
@@ -78,17 +101,7 @@ def dedupe_urls_preserve_order(urls: list[str]) -> list[str]:
         u = (raw or "").strip()
         if not u:
             continue
-        try:
-            p = urlparse(u)
-            host = (p.netloc or "").lower()
-            if host.startswith("www."):
-                host = host[4:]
-            path = p.path or "/"
-            if path != "/" and path.endswith("/"):
-                path = path[:-1]
-            key = f"https://{host}{path}" + (f"?{p.query}" if p.query else "")
-        except Exception:
-            key = u.lower()
+        key = canonical_url_key(u)
         if key in seen:
             continue
         seen.add(key)

@@ -29,6 +29,13 @@ _REF_LINK_DEF_RE = re.compile(
     re.MULTILINE,
 )
 _HTML_TAG_LINE_RE = re.compile(r"^\s*<[^>]+>\s*$")
+# Breadcrumb line: short segments joined by '>' or '|' (e.g. "Home > Brokers > XM").
+# Segments use [^>|\n] so they can never overlap the separator — this is a strictly
+# linear match, avoiding the catastrophic backtracking of a [\w\s]+-based pattern.
+_BREADCRUMB_LINE_RE = re.compile(
+    r"^[ \t]*[^>|\n]{1,80}(?:[ \t]*[>|][ \t]*[^>|\n]{1,80})+[ \t]*$",
+    re.MULTILINE,
+)
 
 
 def _linked_image_repl(match: re.Match[str]) -> str:
@@ -145,9 +152,7 @@ def optimize_markdown_for_llm(
     cleaned_md = re.sub(
         r"(\?|&)utm_[a-zA-Z0-9_]+=[a-zA-Z0-9_\-%]+", "", cleaned_md
     )
-    cleaned_md = re.sub(
-        r"^(?:\s*[\w\s]+\s*(?:>|\|)\s*)+[\w\s]+$", "", cleaned_md, flags=re.MULTILINE
-    )
+    cleaned_md = _BREADCRUMB_LINE_RE.sub("", cleaned_md)
 
     paragraphs = cleaned_md.split("\n\n")
     seen_hashes: set[str] = set()

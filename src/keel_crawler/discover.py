@@ -20,10 +20,11 @@ import logging
 import xml.etree.ElementTree as ET
 from collections import deque
 from typing import Any, Callable, Iterable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
-from keel_crawler.browser.harvest import dedupe_urls_preserve_order, extract_hrefs_regex
+from keel_crawler.browser.harvest import canonical_url_key, extract_hrefs_regex
 from keel_crawler.clean.snapshot import normalize_domain_from_url
+from keel_crawler.normalize import origin_of
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +36,6 @@ def _user_agent() -> str:
         return crawler_setting("user_agent_text")
     except Exception:
         return "keel-crawler"
-
-
-def _origin(url: str) -> str:
-    p = urlparse((url or "").strip())
-    if not p.scheme or not p.netloc:
-        return ""
-    return f"{p.scheme}://{p.netloc}"
 
 
 def _get_bytes(url: str, http_fetcher: Any, *, timeout: int = 20) -> Optional[bytes]:
@@ -117,12 +111,13 @@ def discover_sitemap_urls(
     include: Optional[Callable[[str], bool]] = None,
 ) -> list[str]:
     """Discover page URLs from a site's sitemap(s). Returns a deduped, capped list."""
-    origin = _origin(base_url)
+    origin = origin_of(base_url)
     if not origin:
         return []
     queue: deque[str] = deque(_robots_sitemaps(origin, http_fetcher) or [f"{origin}/sitemap.xml"])
     seen_sm: set[str] = set()
     page_urls: list[str] = []
+    seen_pages: set[str] = set()  # dedup as we go so the max_urls cap counts UNIQUE urls
     fetched = 0
 
     while queue and fetched < max_sitemaps and len(page_urls) < max_urls:
@@ -141,11 +136,17 @@ def discover_sitemap_urls(
         for u in urls:
             if include is not None and not include(u):
                 continue
+            k = canonical_url_key(u)
+            if not k or k in seen_pages:
+                continue
+            seen_pages.add(k)
             page_urls.append(u)
+            if len(page_urls) >= max_urls:
+                break
 
     if fetched >= max_sitemaps and queue:
         logger.info("discover_sitemap_urls: stopped at max_sitemaps=%d (more remained)", max_sitemaps)
-    return dedupe_urls_preserve_order(page_urls)[:max_urls]
+    return page_urls[:max_urls]
 
 
 def http_link_fetcher(
@@ -194,16 +195,13 @@ def deep_crawl(
     seed_domains = {normalize_domain_from_url(s) for s in seed_list}
     seed_domains.discard(None)
 
-    def key(u: str) -> str:
-        return dedupe_urls_preserve_order([u])[0] if u else ""
-
     seen: set[str] = set()
     visited: list[str] = []
     queue: deque[tuple[str, int]] = deque((s, 0) for s in seed_list)
 
     while queue and len(visited) < max_pages:
         url, depth = queue.popleft()
-        k = key(url)
+        k = canonical_url_key(url)
         if not k or k in seen:
             continue
         seen.add(k)
@@ -224,7 +222,7 @@ def deep_crawl(
                 continue
             if match is not None and not match(link):
                 continue
-            lk = key(link)
+            lk = canonical_url_key(link)
             if lk and lk not in seen:
                 queue.append((link, depth + 1))
 

@@ -45,6 +45,7 @@ def apply_deterministic_filter(
     cutoff = timezone.now() - timedelta(hours=hours) if hours > 0 else None
     stats = {"checked": 0, "filtered_out": 0, "passed": 0}
 
+    to_filter: list[FeedItemCandidate] = []
     for item in queryset.select_related("source"):
         stats["checked"] += 1
         reason = ""
@@ -63,8 +64,14 @@ def apply_deterministic_filter(
         if reason:
             item.status = FeedItemCandidate.Status.FILTERED_OUT
             item.filter_reason = reason[:200]
-            item.save(update_fields=["status", "filter_reason", "updated_at"])
+            item.updated_at = timezone.now()
+            to_filter.append(item)
             stats["filtered_out"] += 1
         else:
             stats["passed"] += 1
+
+    if to_filter:
+        FeedItemCandidate.objects.bulk_update(
+            to_filter, ["status", "filter_reason", "updated_at"], batch_size=500
+        )
     return stats

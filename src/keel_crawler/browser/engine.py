@@ -20,8 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlparse
+from typing import Any, Callable, Optional
 
 from keel_crawler import captcha
 from keel_crawler.antibot.classifiers import (
@@ -40,6 +39,7 @@ from keel_crawler.browser.harvest import (
     install_discovery_hooks,
     restore_discovery_hooks,
 )
+from keel_crawler.normalize import hostname_of
 from keel_crawler.pace import AsyncHostThrottle, AsyncRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -48,14 +48,6 @@ _EXTRA_RETRY_ATTEMPTS = 2
 _RETRY_TIMEOUT_BUMP_SEC = 35
 _RETRY_MAX_TIMEOUT_SEC = 180
 _EXTRA_429_ATTEMPTS = 3
-
-
-def _hostname(url: str) -> str:
-    try:
-        host = (urlparse((url or "").strip()).netloc or "").lower()
-    except Exception:
-        host = ""
-    return host[4:] if host.startswith("www.") else host
 
 
 class EgressPreferenceStore:
@@ -299,10 +291,12 @@ class BrowserFetcher:
         attempt_timeout = base_timeout
         last_page = CrawledPage(url=url, text="", error="")
         last_ip = ""
+        attempts_used = 0
         base_cap = _EXTRA_RETRY_ATTEMPTS + 1
         hard_cap = base_cap + _EXTRA_429_ATTEMPTS
         try:
             for attempt in range(hard_cap):
+                attempts_used = attempt + 1
                 holder[0] = ""
                 result = None
                 try:
@@ -338,6 +332,7 @@ class BrowserFetcher:
                 await asyncio.sleep(retry_sleep_seconds(err, attempt))
             return last_page, last_ip
         finally:
+            last_page.attempts = max(1, attempts_used)
             _restore_egress_hook(strategy, prev_hook)
             if harvesting:
                 restore_discovery_hooks(strategy, disc_prev)
@@ -375,7 +370,7 @@ class BrowserFetcher:
         return page
 
     async def _crawl_auto_egress(self, url: str, timeout: int) -> CrawledPage:
-        host = _hostname(url)
+        host = hostname_of(url)
         has_proxy = bool(self._proxy_url)
         if not has_proxy:
             return await self._crawl_new_session(url, timeout, force_proxy=False)

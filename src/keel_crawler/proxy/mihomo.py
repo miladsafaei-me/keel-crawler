@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -57,6 +58,13 @@ class MihomoClient:
         self._group = (group or "").strip() or "AUTO"
         self._scores = score_store if score_store is not None else default_score_store()
         self._enabled = bool(enabled)
+        # Short-lived cache of the group's active outbound. Under a parallel crawl
+        # every result triggers record_success/failure -> active_outbound; without
+        # this each of those does a fresh control-API GET. The outbound only changes
+        # on cycle_next (which invalidates below), so a few seconds of staleness is
+        # harmless for score attribution.
+        self._now_cache: tuple[float, str] | None = None
+        self._now_ttl = 5.0
 
     def is_configured(self) -> bool:
         """True when rotation is allowed (enabled + API base + secret)."""
@@ -95,11 +103,17 @@ class MihomoClient:
             return None
 
     def active_outbound(self, *, timeout_sec: float = 5.0) -> str:
-        """The group's current ``now`` outbound, or ``""``."""
+        """The group's current ``now`` outbound, or ``""`` (cached for a few seconds)."""
         if not self.is_configured():
             return ""
+        if self._now_cache is not None:
+            ts, val = self._now_cache
+            if time.monotonic() - ts < self._now_ttl:
+                return val
         data = self._get_group(timeout_sec=timeout_sec)
-        return (data or {}).get("now", "").strip() if data else ""
+        now = (data or {}).get("now", "").strip() if data else ""
+        self._now_cache = (time.monotonic(), now)
+        return now
 
     def record_success(self, *, timeout_sec: float = 5.0) -> None:
         """Bump the score of the group's active outbound after a good crawl."""
@@ -149,6 +163,7 @@ class MihomoClient:
                     timeout=timeout_sec,
                 )
                 if resp.ok:
+                    self._now_cache = (time.monotonic(), nxt)  # outbound just changed
                     host_hint = ""
                     try:
                         host_hint = urlparse(self._api_base).hostname or ""
