@@ -80,6 +80,25 @@ TTL, no re-download); the three fetch methods now share one `_get_cached` core.
 parallel `run_batch` persists the whole batch with one `bulk_update` instead of N saves.
 `looks_like_cloudflare_interstitial` scans only the leading slice (no full-page lower()).
 
+Perf/logic pass (v0.8.0): the **304 conditional GET** now refreshes only the cache TTL
+(a narrow `UPDATE expires_at`) instead of re-writing the whole body + recomputing its
+SHA on every revalidation (and fixes a stale-expiry L1 re-seed on that path). HTTP
+response bodies are **streamed and capped** (`max_download_bytes`, default 16 MiB; a
+generous 64 MiB cap on `throttled_get` for large sitemaps) so a huge/hostile page can't
+be fully downloaded+decoded; a single **transient retry** (conn error / 429 / 5xx) on
+the HTTP path stops a blip from needlessly escalating to the browser. The L1 cache is
+**bounded by total body bytes** (`l1_max_bytes`), not just entry count. Cheap-first
+escalation parses the HTML **once** — `extract.page_and_visible_len_from_html` yields
+both the extracted page and the JS-shell floor from one lxml parse (was a regex scan +
+a parse); custom `needs_browser` predicates keep their `(html, final_url)` contract.
+`canonical_url_key` strips tracking params (`utm_*`, `gclid`, `fbclid`, …) and sorts the
+rest, so tracking-tagged copies collapse **while pagination/faceted URLs (`page=`, `p=`,
+ids, sort/filter) stay distinct and still enter the frontier**. `parse_sitemap` streams
+via `iterparse` (per-element clear) for bounded memory on 50 MB sitemaps.
+`BrowserFetcher.afetch_many` drains a queue with a fixed pool of `concurrency` workers
+(order-preserving) instead of one coroutine-per-URL. `poll_feeds` writes feed status in
+one `bulk_update`.
+
 User playbook: `docs/USING-KEEL-CRAWLER.md`. Remaining ideas: wire the RSS
 `triage_hook` on the keel-content side; a `robots.txt` disallow/politeness gate for
 fetches (intentionally skipped for now, per owner — discovery already reads robots for
