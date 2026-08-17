@@ -4,6 +4,10 @@ Guidance for Claude Code in **keel-crawler**, a reusable Keel **package** (not a
 consumer app). Inherits the global rules in `~/.claude/CLAUDE.md` and the Keel
 methodology in `~/www/keel-kit/methodology/`.
 
+## Task tracking
+
+Remaining and follow-up work for this project is tracked in [TODO.md](TODO.md), not in chat memory. Every pending task — priority, prerequisites/dependencies, enough context to resume cold — goes there before starting new work; remove a task from TODO.md the moment it's done.
+
 ## What this package is
 
 A **business-blind** web-crawling toolkit, extracted from the
