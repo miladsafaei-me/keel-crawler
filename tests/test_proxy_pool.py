@@ -269,6 +269,34 @@ class RotationTests(unittest.TestCase):
     def test_an_empty_pool_reports_a_dead_end_rather_than_hanging(self):
         self.assertIsNone(ProxyPool(live=[]).acquire(max_wait=5.0))
 
+    def test_an_address_added_mid_crawl_serves_the_next_request(self):
+        """Verification runs in the background, so the pool grows while in use."""
+        pool = ProxyPool(live=[], rps=1000.0, per_minute=0, per_hour=0)
+        self.assertTrue(pool.add(Proxy("10.0.0.7:8080", "http")))
+        self.assertEqual(pool.acquire(max_wait=1.0).addr, "10.0.0.7:8080")
+
+    def test_the_same_address_is_never_added_twice(self):
+        pool = ProxyPool(live=[], rps=1000.0, per_minute=0, per_hour=0)
+        self.assertTrue(pool.add(Proxy("10.0.0.7:8080", "http")))
+        self.assertFalse(pool.add(Proxy("10.0.0.7:8080", "http")))
+        self.assertEqual(len(pool), 1)
+
+    def test_an_empty_pool_waits_while_it_is_still_filling(self):
+        """Empty-but-filling is a gap that closes, not a dead end."""
+        import threading as _t
+
+        pool = ProxyPool(live=[], rps=1000.0, per_minute=0, per_hour=0)
+        pool.filling = True
+        _t.Timer(0.3, lambda: pool.add(Proxy("10.0.0.9:8080", "http"))).start()
+        got = pool.acquire(max_wait=4.0)
+        self.assertIsNotNone(got, "a crawl must not end on a gap that fills itself")
+        self.assertEqual(got.addr, "10.0.0.9:8080")
+
+    def test_an_empty_pool_that_has_finished_filling_is_a_dead_end(self):
+        pool = ProxyPool(live=[], rps=1000.0, per_minute=0, per_hour=0)
+        pool.filling = False
+        self.assertIsNone(pool.acquire(max_wait=1.0))
+
     def test_a_block_reaches_the_store_when_one_is_attached(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ProxyStore(Path(tmp) / "pool.json")

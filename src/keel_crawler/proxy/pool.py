@@ -376,6 +376,9 @@ class ProxyPool:
     rps: float = PER_PROXY_RPS
     per_minute: int = PER_PROXY_PER_MINUTE
     per_hour: int = PER_PROXY_PER_HOUR
+    # True while the background verifier is still adding addresses. It changes
+    # what an empty pool means: not "no egress left", but "none ready yet".
+    filling: bool = False
     _failures: dict = field(default_factory=dict)
     _budgets: dict = field(default_factory=dict)
     _busy: set = field(default_factory=set)
@@ -391,24 +394,57 @@ class ProxyPool:
     def __len__(self) -> int:
         return len(self.live)
 
-    @classmethod
-    def build(cls, probe_url: str, *, want: int = 60, candidates: int = 900,
-              workers: int = 120, timeout: float = 10.0, store: ProxyStore | None = None,
-              accept=looks_usable, refresh: bool = True, target: str = "",
-              rps: float = PER_PROXY_RPS, per_minute: int = PER_PROXY_PER_MINUTE,
-              per_hour: int = PER_PROXY_PER_HOUR, progress=None) -> "ProxyPool":
-        """Verify addresses against the real target until `want` of them answer.
+    def add(self, proxy) -> bool:
+        """Put a newly verified address into rotation immediately.
 
-        Every outcome is written back to the store, so this is also the mechanism
-        that keeps the file healthy: each build promotes what worked, condemns
-        what did not, and prunes what has aged out. There is no separate
-        maintenance job anyone has to remember to run.
+        Safe to call while a crawl is running: a waiting acquirer is woken, so a
+        proxy verified a second ago can serve the very next request.
+        """
+        with self._lock:
+            if any(p.addr == proxy.addr for p in self.live):
+                return False
+            self._budgets.setdefault(
+                proxy.addr,
+                Budget(rps=self.rps, per_minute=self.per_minute, per_hour=self.per_hour),
+            )
+            self.live.append(proxy)
+            self._lock.notify_all()
+            return True
+
+    @classmethod
+    def build(cls, probe_url: str, *, want: int = 60, start_at: int | None = None,
+              candidates: int = 900, workers: int = 120, timeout: float = 10.0,
+              store: ProxyStore | None = None, accept=looks_usable, refresh: bool = True,
+              target: str = "", rps: float = PER_PROXY_RPS,
+              per_minute: int = PER_PROXY_PER_MINUTE, per_hour: int = PER_PROXY_PER_HOUR,
+              progress=None) -> "ProxyPool":
+        """Start as soon as a few addresses answer, and keep filling in the background.
+
+        Verification used to be a blocking phase: check every candidate, *then*
+        begin. That is the wrong shape twice over. It leaves the caller idle for
+        minutes while a slow, mostly-dead candidate list is worked through — and
+        the work does not need a full pool to start, because a pool of ten already
+        supports ten concurrent requests. Worse, the wait grows with `want`
+        precisely because the store hands out its best-evidence addresses first,
+        so each extra address asked for is drawn from a thinner part of the queue.
+
+        So the build returns once `start_at` addresses answer, and a background
+        thread keeps verifying up to `want`, adding each one to rotation the moment
+        it passes. Throughput ramps instead of being paid for up front.
+
+        Every outcome is still written back to the store, so this remains the
+        mechanism that keeps the file healthy — promoting what worked, condemning
+        what did not, pruning what aged out — with no separate maintenance job.
         """
         from concurrent.futures import ThreadPoolExecutor
 
         store = store or ProxyStore()
         if not target:
             target = probe_url.split("/")[2] if "//" in probe_url else probe_url
+        if start_at is None:
+            start_at = max(1, min(want, 10))
+        start_at = min(start_at, want)
+
         if refresh:
             summary = store.refresh()
             if progress:
@@ -417,34 +453,55 @@ class ProxyPool:
 
         batch = store.candidates(limit=candidates)
         if progress:
-            progress(f"proxy store: verifying {len(batch):,} candidates against the target")
+            progress(f"proxy store: verifying up to {len(batch):,} candidates; "
+                     f"starting as soon as {start_at} answer, filling to {want}")
 
-        live: list = []
+        pool = cls(live=[], target=target, store=store, rps=rps,
+                   per_minute=per_minute, per_hour=per_hour)
         results: dict = {}
+        finished = threading.Event()
 
         def check(proxy):
             status, body = fetch_through(proxy, probe_url, timeout)
             return proxy, status, body
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for proxy, status, body in executor.map(check, batch):
-                ok = accept(status, body)
-                results[proxy.addr] = ok
-                if ok:
-                    live.append(proxy)
-                    if len(live) >= want:
-                        break
-        store.record_result(results, target=target)
+        def verify_all():
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    for proxy, status, body in executor.map(check, batch):
+                        ok = accept(status, body)
+                        results[proxy.addr] = ok
+                        if ok:
+                            pool.add(proxy)
+                            if len(pool) >= want:
+                                break
+            finally:
+                # Record even on an early exit: outcomes already gathered are the
+                # only thing that makes the next build faster.
+                try:
+                    store.record_result(dict(results), target=target)
+                except Exception:  # noqa: BLE001 - never kill a crawl over bookkeeping
+                    pass
+                pool.validated_from = len(results)
+                pool.filling = False
+                finished.set()
+                if progress:
+                    checked = len(results)
+                    progress(f"proxy pool: filled to {len(pool)} from {checked} checked "
+                             f"({100 * len(pool) / max(1, checked):.1f}% usable) — "
+                             f"ceiling ≈ {len(pool) * rps:.0f} req/s, "
+                             f"{len(pool) * per_hour:,}/hour")
 
-        if progress:
-            checked = len(results)
-            progress(f"proxy pool: {len(live)} of {checked} verified proxies answered "
-                     f"({100 * len(live) / max(1, checked):.1f}%)")
-            progress(f"proxy pool: each address capped at {rps}/s, {per_minute}/min, "
-                     f"{per_hour}/hour — ceiling ≈ {len(live) * rps:.0f} req/s, "
-                     f"{len(live) * per_hour:,}/hour")
-        return cls(live=live, target=target, store=store, validated_from=len(results),
-                   rps=rps, per_minute=per_minute, per_hour=per_hour)
+        pool.filling = True
+        threading.Thread(target=verify_all, name="proxy-pool-fill", daemon=True).start()
+
+        # Wait only for the first few, not for the whole list.
+        while len(pool) < start_at and not finished.is_set():
+            finished.wait(0.25)
+        if progress and len(pool):
+            progress(f"proxy pool: {len(pool)} address(es) ready — starting now, "
+                     f"filling to {want} in the background")
+        return pool
 
     def acquire(self, max_wait: float = 120.0):
         """Hand out the most-rested idle address, waiting if every one is spending.
@@ -468,7 +525,15 @@ class ProxyPool:
         with self._lock:
             while True:
                 if not self.live:
-                    return None
+                    # An empty pool is only a dead end once nothing more is
+                    # coming. While the background verifier is still working,
+                    # every address may simply have been evicted faster than
+                    # replacements arrive - so wait for one rather than ending
+                    # the crawl on a gap that closes by itself.
+                    if not self.filling or time.monotonic() >= deadline:
+                        return None
+                    self._lock.wait(0.25)
+                    continue
                 now = time.monotonic()
                 idle = [p for p in self.live if p.addr not in self._busy]
                 if idle:
@@ -535,6 +600,7 @@ class ProxyPool:
                 "blocked_by_target": self.blocked,
                 "retired_unreliable": self.retired,
                 "requests_served": self.served,
+                "still_filling": self.filling,
                 "target": self.target,
                 "per_proxy_limits": {"per_second": self.rps, "per_minute": self.per_minute,
                                      "per_hour": self.per_hour},

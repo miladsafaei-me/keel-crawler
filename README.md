@@ -147,6 +147,16 @@ mid-request is never handed out again, selection is least-recently-used rather
 than round-robin, and nothing is issued before its own budget allows. Ceiling ≈
 pool size × per-address rate.
 
+**It starts before the pool is full.** Verification used to be a blocking phase —
+check every candidate, *then* begin — which left the caller idle for minutes and
+got worse the more addresses were asked for, because the store hands out its
+best-evidence addresses first and each extra one comes from a thinner part of the
+queue. `build()` now returns as soon as `start_at` (default 10) addresses answer
+and keeps filling to `want` in a background thread, adding each to rotation the
+moment it passes. Throughput ramps instead of being paid up front, and an empty
+pool that is still filling makes `acquire()` wait rather than declaring a dead
+end.
+
 Maintenance and inspection:
 
 ```bash
