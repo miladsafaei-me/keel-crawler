@@ -139,8 +139,15 @@ cheerfully fetches `httpbin.org` may still be refused by the endpoint that
 matters. Pass `accept=` to say what a real answer looks like, because a captive
 portal also returns 200.
 
-**Pacing is per address, on three timescales at once** — 1 request/5s, 10/minute,
-200/hour by default. A single global rate does not achieve this: as addresses are
+**Pacing is per address, on three timescales at once** — 1.5/s, 90/minute,
+1,500/hour by default, and those are measured rather than guessed. A burn test
+put 30 addresses through five rate cohorts (0.2/s up to unthrottled) and pushed
+15,553 requests: **not one was blocked**, which retired an earlier guess that was
+18x too conservative. It also showed free proxies self-limit before the endpoint
+does — the unthrottled cohort achieved 0.18-1.45 req/s, the same as the 2/s
+cohort, because proxy latency sets the pace. The hourly figure is the largest
+volume actually tested per address, not an extrapolation: nothing blocked, so
+this is a floor, and the true ceiling is still unknown. A single global rate does not achieve this: as addresses are
 evicted the survivors absorb the whole rate and inherit exactly the traffic that
 got the first ones blocked. Work spreads rather than queues — an address
 mid-request is never handed out again, selection is least-recently-used rather

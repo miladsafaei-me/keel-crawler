@@ -73,13 +73,25 @@ MAX_RECORDS = 20_000
 # What one address is allowed to do, on three timescales at once. A single global
 # rate does not achieve this: as addresses are evicted the survivors absorb the
 # whole rate, so the last few inherit exactly the traffic that got the first ones
-# blocked. These are far below the one blocking event actually measured - ~5,000
-# requests at 57 q/s from a single IP earned a refusal that held sixteen hours -
-# and because it is still unknown whether the trigger is rate or cumulative
-# count, all three timescales are capped rather than just the rate.
-PER_PROXY_RPS = 0.2
-PER_PROXY_PER_MINUTE = 10
-PER_PROXY_PER_HOUR = 200
+# blocked.
+#
+# These numbers are measured, and the first version of them was not. They began
+# as 0.2/s and 200/hour, reasoned as "an order of magnitude under the one block
+# ever observed" - a guess wearing a number's clothes. A deliberate burn test
+# (2026-09-02) put 30 addresses through five rate cohorts, from 0.2/s to
+# unthrottled, and pushed 15,553 requests: **not one address was blocked**, at any
+# rate, up to 1,500 requests each. The old ceiling was roughly 18x too low.
+#
+# Two things that test settled. Free proxies self-limit long before Google does:
+# the unthrottled cohort achieved 0.18-1.45 req/s, identical to the 2/s cohort,
+# because proxy latency - not our throttle and not the endpoint - sets the pace.
+# A per-address rate above ~1.5/s is therefore meaningless. And the hourly figure
+# is set to exactly the largest volume actually tested per address rather than
+# extrapolated, because the test found a floor, not a ceiling: nothing blocked,
+# so the true limit is somewhere above this and remains unknown.
+PER_PROXY_RPS = 1.5
+PER_PROXY_PER_MINUTE = 90
+PER_PROXY_PER_HOUR = 1500
 
 LIVE = "live"
 UNVERIFIED = "unverified"
