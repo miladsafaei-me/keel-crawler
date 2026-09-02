@@ -412,7 +412,7 @@ class ProxyPool:
             return True
 
     @classmethod
-    def build(cls, probe_url: str, *, want: int = 60, start_at: int | None = None,
+    def build(cls, probe_url: str, *, want: int = 0, start_at: int | None = None,
               candidates: int = 900, workers: int = 120, timeout: float = 10.0,
               store: ProxyStore | None = None, accept=looks_usable, refresh: bool = True,
               target: str = "", rps: float = PER_PROXY_RPS,
@@ -441,9 +441,15 @@ class ProxyPool:
         store = store or ProxyStore()
         if not target:
             target = probe_url.split("/")[2] if "//" in probe_url else probe_url
+        # want=0 means "keep everything that answers". There is no reason to
+        # discard a verified address: throughput is live addresses x the
+        # per-address budget, so a cap on the pool is a cap on the crawl, and the
+        # real spend is `candidates` - how many are *tested* - not how many pass.
+        unlimited = want <= 0
         if start_at is None:
-            start_at = max(1, min(want, 10))
-        start_at = min(start_at, want)
+            start_at = 10 if unlimited else max(1, min(want, 10))
+        if not unlimited:
+            start_at = min(start_at, want)
 
         if refresh:
             summary = store.refresh()
@@ -452,9 +458,10 @@ class ProxyPool:
                          f"{summary['new']:,} new, {summary['revived']:,} revived")
 
         batch = store.candidates(limit=candidates)
+        target_text = "keeping every one that answers" if unlimited else f"filling to {want}"
         if progress:
             progress(f"proxy store: verifying up to {len(batch):,} candidates; "
-                     f"starting as soon as {start_at} answer, filling to {want}")
+                     f"starting as soon as {start_at} answer, {target_text}")
 
         pool = cls(live=[], target=target, store=store, rps=rps,
                    per_minute=per_minute, per_hour=per_hour)
@@ -473,7 +480,7 @@ class ProxyPool:
                         results[proxy.addr] = ok
                         if ok:
                             pool.add(proxy)
-                            if len(pool) >= want:
+                            if not unlimited and len(pool) >= want:
                                 break
             finally:
                 # Record even on an early exit: outcomes already gathered are the
@@ -500,7 +507,7 @@ class ProxyPool:
             finished.wait(0.25)
         if progress and len(pool):
             progress(f"proxy pool: {len(pool)} address(es) ready — starting now, "
-                     f"filling to {want} in the background")
+                     f"{target_text} in the background")
         return pool
 
     def acquire(self, max_wait: float = 120.0):

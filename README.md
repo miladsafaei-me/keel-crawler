@@ -147,6 +147,12 @@ mid-request is never handed out again, selection is least-recently-used rather
 than round-robin, and nothing is issued before its own budget allows. Ceiling ≈
 pool size × per-address rate.
 
+**There is no cap on the pool.** `want` defaults to 0, meaning *keep every
+address that answers*. Discarding a verified address makes no sense: throughput
+is `live addresses x per-address budget`, so a cap on the pool is a cap on the
+crawl. The real spend is `candidates` — how many are *tested* — not how many
+pass. Set `want` to a number only when a small pool is genuinely wanted.
+
 **It starts before the pool is full.** Verification used to be a blocking phase —
 check every candidate, *then* begin — which left the caller idle for minutes and
 got worse the more addresses were asked for, because the store hands out its

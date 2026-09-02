@@ -266,6 +266,19 @@ class RotationTests(unittest.TestCase):
         pool.report_failure(flaky)
         self.assertEqual(len(pool), 1)
 
+    def test_want_zero_means_keep_every_address_that_answers(self):
+        """A cap on the pool is a cap on the crawl, so there is no default cap."""
+        import inspect
+
+        self.assertEqual(inspect.signature(ProxyPool.build).parameters["want"].default, 0,
+                         "the pool must not discard verified addresses by default")
+
+    def test_a_pool_grows_past_any_previous_default(self):
+        pool = ProxyPool(live=[], rps=1000.0, per_minute=0, per_hour=0)
+        for i in range(200):
+            pool.add(Proxy(f"10.1.{i // 256}.{i % 256}:8080", "http"))
+        self.assertEqual(len(pool), 200)
+
     def test_an_empty_pool_reports_a_dead_end_rather_than_hanging(self):
         self.assertIsNone(ProxyPool(live=[]).acquire(max_wait=5.0))
 
