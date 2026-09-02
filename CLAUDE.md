@@ -19,6 +19,14 @@ is injected by the host through config or callable hooks — **never** hardcoded
 
 ## The boundary — what belongs here vs the consumer
 
+**Proxy rotation is owned here, for every Keel project.** Two shapes, one home:
+`proxy/pool.py` for many disposable public addresses (self-harvesting from 16
+published lists, target-verified, self-pruning store, per-address budgets), and
+`proxy/mihomo.py` + `proxy/scores.py` for a few configured outbounds. A consumer
+that needs rotation imports it — keel-seo does, via its `proxies` extra — and
+must not grow its own. `proxy/jsonstore.py` is the shared on-disk primitive both
+use; do not add a third copy of it.
+
 **Here (generic):** the fetch transport + cache, the anti-bot/proxy escalation
 engine, error classifiers, browser config builders, Markdown cleaning, snapshot
 storage plumbing, the generic `CrawlJob` status machine, and the RSS *transport*
@@ -36,7 +44,7 @@ deduped, staged raw item".
 | Layer | Module | Status |
 |---|---|---|
 | 0 Fetch | `fetch/client.py` (`HttpFetcher`, concurrent `fetch_many`) + `fetch/hybrid.py` (`HybridFetcher`, cheap-first) | done |
-| 1 Resilience | `antibot/classifiers.py`, `proxy/scores.py` + `proxy/mihomo.py`, `browser/{config,extract,engine}.py`, `captcha.py` | done |
+| 1 Resilience | `antibot/classifiers.py`, `proxy/scores.py` + `proxy/mihomo.py`, `proxy/pool.py` + `proxy/sources.py` + `proxy/jsonstore.py`, `browser/{config,extract,engine}.py`, `captcha.py` | done |
 | 2 Normalize | `clean/markdown.py` + `clean/snapshot.py` (`SnapshotStore`, `build_merged_markdown`) | done |
 | 3 Orchestrate | `models.CrawlJob` + `orchestrate.py` (`CrawlSpec`, `run_batch`, transport adapters); `progress.py` | done |
 | 4 RSS | `models.FeedSource`/`FeedItemCandidate` + `rss/{monitor,filters,triage}.py` + `crawler_rss_poll` (behind `[rss]`) | done |

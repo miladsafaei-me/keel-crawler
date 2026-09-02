@@ -20,9 +20,10 @@ import logging
 import os
 from pathlib import Path
 
+from keel_crawler.proxy.jsonstore import FdHandle, PlainHandle, dumps, locked
+
 logger = logging.getLogger(__name__)
 
-_MAX_READ_BYTES = 2_000_000
 _MIN_SCORE = -1_000_000
 _MAX_SCORE = 1_000_000
 _MISSING_DELAY_SORT = 10**9
@@ -210,79 +211,18 @@ class ProxyScoreStore:
                     handle.write(delays)
 
 
-class _locked:
-    """Context manager: exclusive-lock a JSON file, yield a read/write handle.
-
-    Falls back to plain read/write when ``fcntl`` is unavailable (non-POSIX).
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._fd = None
-        self._fcntl = None
-
-    def __enter__(self):
-        try:
-            import fcntl
-
-            self._fcntl = fcntl
-        except ImportError:
-            self._fcntl = None
-        if self._fcntl is None:
-            return _PlainHandle(self._path)
-        self._fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT, 0o644)
-        self._fcntl.flock(self._fd, self._fcntl.LOCK_EX)
-        return _FdHandle(self._fd)
-
-    def __exit__(self, *exc):
-        if self._fd is not None:
-            try:
-                self._fcntl.flock(self._fd, self._fcntl.LOCK_UN)
-            finally:
-                os.close(self._fd)
-        return False
-
-
-def _dumps(data: dict) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=0, sort_keys=True)
-
-
-class _FdHandle:
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
-
-    def read(self) -> object:
-        os.lseek(self._fd, 0, os.SEEK_SET)
-        raw_b = os.read(self._fd, _MAX_READ_BYTES)
-        raw = raw_b.decode("utf-8", errors="replace") if raw_b else ""
-        if not raw.strip():
-            return {}
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {}
-
-    def write(self, data: dict) -> None:
-        payload = _dumps(data).encode("utf-8")
-        os.ftruncate(self._fd, 0)
-        os.lseek(self._fd, 0, os.SEEK_SET)
-        os.write(self._fd, payload)
-
-
-class _PlainHandle:
-    def __init__(self, path: Path) -> None:
-        self._path = path
-
-    def read(self) -> object:
-        if not self._path.is_file():
-            return {}
-        try:
-            return json.loads(self._path.read_text(encoding="utf-8") or "{}")
-        except Exception:
-            return {}
-
-    def write(self, data: dict) -> None:
-        self._path.write_text(_dumps(data), encoding="utf-8")
+# The lock-guarded JSON file underneath this store now lives in
+# keel_crawler.proxy.jsonstore, because keel_crawler.proxy.pool needs the same
+# primitive. Two copies of a concurrency helper diverge quietly and are then very
+# hard to debug, so it was extracted rather than duplicated. These aliases keep
+# this module's existing call sites unchanged.
+_locked = locked
+# Kept at this module's original value: the shared helper allows a larger file,
+# and a score file that big means something is wrong rather than something big.
+_MAX_READ_BYTES = 2_000_000
+_dumps = dumps
+_FdHandle = FdHandle
+_PlainHandle = PlainHandle
 
 
 def _scoring_enabled_from_config() -> bool:
