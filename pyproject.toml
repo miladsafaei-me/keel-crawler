@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keel-crawler"
-version = "0.14.0"
+version = "0.14.1"
 description = "Keel Crawler — a reusable, business-blind web-crawling toolkit: cheap-first HTTP fetch with a shared response cache, a browser/anti-bot escalation engine, proxy rotation (a self-maintaining public-proxy pool and a Mihomo outbound switcher), LLM-ready Markdown cleaning, and RSS source monitoring — extracted from the Revenika/Propopedia/Binarystyle crawlers."
 readme = "README.md"
 requires-python = ">=3.10"

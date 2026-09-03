@@ -413,6 +413,21 @@ class RepairingALabelAlreadyStored(unittest.TestCase):
         self.assertEqual(entry["country"], "United States")
 
 
+class ThePackageVersion(unittest.TestCase):
+    """It was reporting 0.13.1 from a 0.14.0 install, and nothing failed."""
+
+    def test_it_matches_the_one_file_ci_actually_guards(self):
+        import re
+
+        import keel_crawler
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        declared = re.search(r'^version\s*=\s*"([^"]+)"',
+                             pyproject.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(declared)
+        self.assertEqual(keel_crawler.__version__, declared.group(1))
+
+
 class TheHostWideHarvestMutex(unittest.TestCase):
     """One spender at a time, because the budgets are enforced in memory."""
 
