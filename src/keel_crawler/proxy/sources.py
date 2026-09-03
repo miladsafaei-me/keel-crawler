@@ -199,3 +199,60 @@ def geolocate(ips, timeout: float = 20.0, batch: int = GEO_BATCH) -> dict:
                 if code:
                     found[row.get("query", "")] = code
     return found
+
+
+# Country names as the published lists write them, mapped to ISO codes. The
+# lists and the geolocation service disagree on form - one says "United States",
+# the other "US" - and left alone that splits a single country into two labels
+# nobody can group by. Measured on one harvest: 78 distinct labels for about 50
+# countries, with United States/US and France/FR each appearing twice.
+#
+# Every name below was observed in real data; the rest are common enough to be
+# worth having before they are.
+COUNTRY_CODES = {
+    "united states": "US", "united kingdom": "GB", "hong kong": "HK",
+    "singapore": "SG", "france": "FR", "saudi arabia": "SA", "netherlands": "NL",
+    "the netherlands": "NL", "kosovo": "XK", "switzerland": "CH",
+    "south korea": "KR", "korea": "KR", "indonesia": "ID", "russia": "RU",
+    "russian federation": "RU", "philippines": "PH", "india": "IN",
+    "united arab emirates": "AE", "sweden": "SE", "vietnam": "VN",
+    "viet nam": "VN", "thailand": "TH", "colombia": "CO", "south africa": "ZA",
+    "canada": "CA", "mexico": "MX", "japan": "JP", "serbia": "RS",
+    "argentina": "AR", "tanzania": "TZ", "kenya": "KE", "iraq": "IQ",
+    "kazakhstan": "KZ", "ecuador": "EC", "dominican republic": "DO",
+    "chile": "CL", "lithuania": "LT", "finland": "FI", "malaysia": "MY",
+    "syria": "SY", "montenegro": "ME", "spain": "ES", "peru": "PE",
+    "cambodia": "KH", "egypt": "EG", "albania": "AL", "venezuela": "VE",
+    "bangladesh": "BD", "libya": "LY", "germany": "DE", "brazil": "BR",
+    "china": "CN", "turkey": "TR", "türkiye": "TR", "italy": "IT",
+    "poland": "PL", "ukraine": "UA", "iran": "IR", "pakistan": "PK",
+    "nigeria": "NG", "czechia": "CZ", "czech republic": "CZ", "romania": "RO",
+    "bulgaria": "BG", "israel": "IL", "australia": "AU", "new zealand": "NZ",
+    "norway": "NO", "denmark": "DK", "austria": "AT", "belgium": "BE",
+    "portugal": "PT", "greece": "GR", "hungary": "HU", "ireland": "IE",
+    "taiwan": "TW", "nepal": "NP", "sri lanka": "LK", "myanmar": "MM",
+    "morocco": "MA", "algeria": "DZ", "tunisia": "TN", "ghana": "GH",
+    "uganda": "UG", "ethiopia": "ET", "sudan": "SD", "yemen": "YE",
+    "jordan": "JO", "lebanon": "LB", "kuwait": "KW", "qatar": "QA",
+    "bahrain": "BH", "oman": "OM", "uzbekistan": "UZ", "azerbaijan": "AZ",
+    "georgia": "GE", "armenia": "AM", "belarus": "BY", "moldova": "MD",
+    "latvia": "LV", "estonia": "EE", "slovakia": "SK", "slovenia": "SI",
+    "croatia": "HR", "bosnia and herzegovina": "BA", "north macedonia": "MK",
+    "cyprus": "CY", "malta": "MT", "iceland": "IS", "luxembourg": "LU",
+    "bolivia": "BO", "paraguay": "PY", "uruguay": "UY", "costa rica": "CR",
+    "panama": "PA", "guatemala": "GT", "honduras": "HN", "el salvador": "SV",
+    "nicaragua": "NI", "cuba": "CU", "jamaica": "JM", "puerto rico": "PR",
+}
+
+
+def normalize_country(label: str) -> str:
+    """One country, one label: an ISO-3166 alpha-2 code, or "" if unrecognised.
+
+    Applied wherever a country is read rather than only where it is written, so
+    data already collected under the older mixed labels normalises on the way out
+    instead of needing to be gathered again.
+    """
+    label = (label or "").strip()
+    if len(label) == 2 and label.isalpha():
+        return label.upper()
+    return COUNTRY_CODES.get(label.lower(), "")

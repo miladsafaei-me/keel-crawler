@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 
 from keel_crawler.proxy.jsonstore import data_dir, locked
 from keel_crawler.proxy.sources import (SOURCES, USER_AGENT, fetch_all,
-                                        geolocate)
+                                        geolocate, normalize_country)
 
 # The ageing policy, stated in one place so it can be read without tracing
 # conditionals. Consecutive failed checks before an address is considered dead:
@@ -284,8 +284,14 @@ class ProxyStore:
         """
         with locked(self.path) as handle:
             records = self._load(handle)
-        known = {a: records[a]["country"] for a in addrs
-                 if a in records and records[a].get("country")}
+        # Only an ISO code counts as known. A stored full name ("United States")
+        # is re-resolved rather than trusted, which is how the older mixed labels
+        # converge on one form instead of persisting forever.
+        known = {}
+        for addr in addrs:
+            code = normalize_country((records.get(addr) or {}).get("country", ""))
+            if code:
+                known[addr] = code
         missing = [a for a in addrs if a not in known]
         if not missing:
             return known
@@ -299,7 +305,7 @@ class ProxyStore:
                 records = self._load(handle)
                 for addr in missing:
                     code = found.get(addr.split(":")[0])
-                    if code and addr in records and not records[addr].get("country"):
+                    if code and addr in records:
                         records[addr]["country"] = code
                 self._save(handle, records)
             for addr in missing:

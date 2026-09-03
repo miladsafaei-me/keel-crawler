@@ -26,7 +26,7 @@ from keel_crawler.proxy.mihomo import MihomoClient, mihomo_from_config
 from keel_crawler.proxy.pool import (Budget, Proxy, ProxyPool, ProxyStore,
                                      fetch_through, looks_usable)
 from keel_crawler.proxy.scores import ProxyScoreStore, default_score_store
-from keel_crawler.proxy.sources import SOURCES, Source
+from keel_crawler.proxy.sources import SOURCES, Source, normalize_country
 
 __all__ = [
     "Budget",
@@ -37,6 +37,7 @@ __all__ = [
     "ProxyStore",
     "SOURCES",
     "Source",
+    "normalize_country",
     "default_score_store",
     "fetch_through",
     "looks_usable",
