@@ -27,6 +27,20 @@ that needs rotation imports it — keel-seo does, via its `proxies` extra — an
 must not grow its own. `proxy/jsonstore.py` is the shared on-disk primitive both
 use; do not add a third copy of it.
 
+**And rotation is not optional for list-scale fetching.** A crawl never leaves
+from the machine running it, laptop or production host, because the punishment
+is IP-wide and outlasts the run: measured 2026-09-04, a keyword harvest asking
+Google directly at a throttled 6 q/s was refused after 3,909 requests, and the
+refusal covered every request from that address — a host carrying six live
+sites — for over an hour. Throttling buys nothing here; the per-address budgets
+in `proxy/pool.py` exist to keep *rotated* addresses alive, not to make a single
+address safe. keel-seo's harvester enforces this in code (v0.28.0: direct egress
+refused, no override), and anything else built on this package is expected to
+default the same way. The standing exception is a single long-lived browser
+session that has already cleared a challenge — rotating under it re-triggers the
+challenge — which is a session at human pace, not a sweep. Cross-project
+statement of the rule: `keel-kit/methodology/seo-core.md`.
+
 **Here (generic):** the fetch transport + cache, the anti-bot/proxy escalation
 engine, error classifiers, browser config builders, Markdown cleaning, snapshot
 storage plumbing, the generic `CrawlJob` status machine, and the RSS *transport*

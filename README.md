@@ -93,6 +93,17 @@ disposable addresses. **Any Keel project needing proxy rotation should use this
 rather than growing its own** — keel-seo's keyword crawler is the first consumer,
 via `pip install 'keel-seo[proxies]'`.
 
+**Use it before the block, not after it.** A crawl does not leave from the
+machine running it — not a laptop, and least of all a production host — because
+the punishment is never confined to the crawl that earns it. Google's
+autocomplete refusal, measured 2026-09-04, is IP-wide and lasts over an hour: a
+harvest asking directly at a throttled 6 q/s was refused after 3,909 requests,
+and with it went every other request from a server carrying six live sites.
+Throttling is not the defence; the per-address budgets below exist to keep
+*rotated* addresses alive, not to make one address safe. keel-seo enforces this
+in code since v0.28.0 — direct egress refused, no override — and anything else
+built on this package should default the same way.
+
 ```python
 from keel_crawler.proxy import ProxyPool, fetch_through
 
