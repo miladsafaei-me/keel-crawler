@@ -164,6 +164,23 @@ mid-request is never handed out again, selection is least-recently-used rather
 than round-robin, and nothing is issued before its own budget allows. Ceiling ≈
 pool size × per-address rate.
 
+**One spender at a time per machine.** The budgets above are enforced in memory,
+per process. Two runs rotating over the same store therefore each believe they
+are the only spender, charge every address twice its limit, and earn precisely
+the block the budgets exist to prevent — a real hazard now that several projects
+share one host and one store. So anything that spends the pool takes the
+host-wide mutex first:
+
+```python
+from keel_crawler.proxy import harvest_lock
+
+with harvest_lock() as got:      # blocks until the other run finishes
+    ...                          # harvest_lock(wait=False) reports instead
+```
+
+It is keyed on the shared store's directory, not on the caller, so two different
+consumers serialise instead of colliding.
+
 **There is no cap on the pool.** `want` defaults to 0, meaning *keep every
 address that answers*. Discarding a verified address makes no sense: throughput
 is `live addresses x per-address budget`, so a cap on the pool is a cap on the

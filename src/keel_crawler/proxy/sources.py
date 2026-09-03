@@ -126,12 +126,29 @@ def parse(text: str) -> list[tuple[str, str]]:
     return found
 
 
+def decode(raw: bytes) -> str:
+    """Text from a published list, trying UTF-8 first and Windows-1252 second.
+
+    None of these lists sends a usable charset, and a few serve country names in
+    Windows-1252. Decoding those as UTF-8 with ``errors="replace"`` does not
+    merely mangle a glyph, it destroys the label: "Türkiye" becomes "T\ufffdrkiye",
+    which then matches no country name and is stored as a country of its own.
+    Fourteen addresses were held under exactly that label before this existed.
+    """
+    for encoding in ("utf-8", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def fetch(source: Source, timeout: float = 25.0) -> list[tuple[str, str]]:
     """Pull and parse one list. Never raises — a dead source yields nothing."""
     try:
         request = urllib.request.Request(source.url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return parse(response.read().decode("utf-8", "replace"))
+            return parse(decode(response.read()))
     except Exception:  # noqa: BLE001 - one dead list must not end a refresh
         return []
 
@@ -155,7 +172,14 @@ def fetch_all(sources: tuple[Source, ...] = SOURCES, timeout: float = 25.0,
                            "publishers": set()}
                 )
                 entry["publishers"].add(source.publisher)
-                if country and not entry["country"]:
+                # Take the new label when there is none, and also when the one
+                # held does not resolve to a country while the new one does.
+                # Without the second half, a label corrupted before `decode`
+                # existed - or simply misspelled by one publisher - is kept
+                # forever and no later refresh can repair it.
+                if country and (not entry["country"]
+                                or (not normalize_country(entry["country"])
+                                    and normalize_country(country))):
                     entry["country"] = country
     for entry in merged.values():
         entry["publishers"] = sorted(entry["publishers"])
@@ -242,6 +266,25 @@ COUNTRY_CODES = {
     "bolivia": "BO", "paraguay": "PY", "uruguay": "UY", "costa rica": "CR",
     "panama": "PA", "guatemala": "GT", "honduras": "HN", "el salvador": "SV",
     "nicaragua": "NI", "cuba": "CU", "jamaica": "JM", "puerto rico": "PR",
+    # Observed in the store on 2026-09-03, each one losing its country because
+    # the map did not carry the name the list publishes.
+    "seychelles": "SC", "kyrgyzstan": "KG", "afghanistan": "AF",
+    "palestine": "PS", "papua new guinea": "PG", "zimbabwe": "ZW",
+    "british virgin islands": "VG", "somalia": "SO", "gabon": "GA",
+    "belize": "BZ",
+    # The long ISO-3166 forms, which geolocation services return where the
+    # published lists use the short name. A comma or a parenthesis is enough to
+    # miss the entry and drop the country.
+    "korea, republic of": "KR", "korea, democratic people's republic of": "KP",
+    "iran (islamic republic of)": "IR", "iran, islamic republic of": "IR",
+    "russian federation, the": "RU", "syrian arab republic": "SY",
+    "tanzania, united republic of": "TZ", "bolivia (plurinational state of)": "BO",
+    "venezuela (bolivarian republic of)": "VE", "moldova, republic of": "MD",
+    "viet nam, socialist republic of": "VN", "lao people's democratic republic": "LA",
+    "taiwan, province of china": "TW", "macao": "MO", "macau": "MO",
+    "côte d'ivoire": "CI", "cote d'ivoire": "CI", "curaçao": "CW",
+    "congo, the democratic republic of the": "CD", "congo": "CG",
+    "united states of america": "US", "great britain": "GB",
 }
 
 

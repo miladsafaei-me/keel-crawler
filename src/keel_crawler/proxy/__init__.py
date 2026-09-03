@@ -21,7 +21,14 @@ Which to use: the pool when you need many disposable addresses and per-address
 quality is negotiable; Mihomo when you have a few good ones and want the best of
 them chosen. They share :mod:`keel_crawler.proxy.jsonstore` for on-disk state and
 are otherwise independent.
+
+**One spender at a time per machine.** The per-address budgets are enforced in
+memory, so two processes rotating over the same store each charge every address
+its full limit and earn the block the budgets exist to prevent. Anything that
+spends the pool takes ``harvest_lock()`` first; it is keyed on the shared store,
+not on the calling project, so consumers on one host serialise.
 """
+from keel_crawler.proxy.jsonstore import harvest_lock
 from keel_crawler.proxy.mihomo import MihomoClient, mihomo_from_config
 from keel_crawler.proxy.pool import (Budget, Proxy, ProxyPool, ProxyStore,
                                      fetch_through, looks_usable)
@@ -40,6 +47,7 @@ __all__ = [
     "normalize_country",
     "default_score_store",
     "fetch_through",
+    "harvest_lock",
     "looks_usable",
     "mihomo_from_config",
 ]

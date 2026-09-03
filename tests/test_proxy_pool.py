@@ -17,6 +17,7 @@ from keel_crawler.proxy.pool import (BLOCK_MEMORY_SECONDS, DEAD, DEAD_MEMORY_SEC
                                      FAILURE_LIMIT, LIVE, STALE_LIVE_SECONDS,
                                      UNVERIFIED, UNVERIFIED_TTL_SECONDS, Budget,
                                      Proxy, ProxyPool, ProxyStore)
+from keel_crawler.proxy import sources
 from keel_crawler.proxy.sources import SOURCES, parse
 
 DAY = 24 * 3600
@@ -350,6 +351,91 @@ class JsonStoreTests(unittest.TestCase):
                 handle.write({"key": "y"})
             with jsonstore.locked(path) as handle:
                 self.assertEqual(handle.read(), {"key": "y"})
+
+
+class DecodingPublishedLists(unittest.TestCase):
+    """A country name must survive the wire, or it becomes its own country."""
+
+    def test_a_windows_1252_country_name_decodes_to_the_real_name(self):
+        raw = "1.2.3.4:8080:T\u00fcrkiye".encode("cp1252")
+        self.assertEqual(sources.decode(raw), "1.2.3.4:8080:T\u00fcrkiye")
+
+    def test_utf8_is_still_preferred_over_the_fallback(self):
+        raw = "1.2.3.4:8080:T\u00fcrkiye".encode("utf-8")
+        self.assertEqual(sources.decode(raw), "1.2.3.4:8080:T\u00fcrkiye")
+
+    def test_the_old_replacement_behaviour_would_have_lost_the_country(self):
+        raw = "T\u00fcrkiye".encode("cp1252")
+        mangled = raw.decode("utf-8", "replace")
+        self.assertEqual(sources.normalize_country(mangled), "")
+        self.assertEqual(sources.normalize_country(sources.decode(raw)), "TR")
+
+
+class CountryNamesTheListsActuallyPublish(unittest.TestCase):
+    def test_names_that_were_silently_dropped_now_resolve(self):
+        for name, code in (("Seychelles", "SC"), ("Kyrgyzstan", "KG"),
+                           ("Afghanistan", "AF"), ("Palestine", "PS"),
+                           ("Papua New Guinea", "PG"), ("Zimbabwe", "ZW"),
+                           ("British Virgin Islands", "VG"), ("Somalia", "SO"),
+                           ("Gabon", "GA"), ("Belize", "BZ")):
+            self.assertEqual(sources.normalize_country(name), code, name)
+
+    def test_the_long_iso_forms_resolve_too(self):
+        for name, code in (("Korea, Republic of", "KR"),
+                           ("Iran (Islamic Republic of)", "IR"),
+                           ("Taiwan, Province of China", "TW"),
+                           ("United States of America", "US")):
+            self.assertEqual(sources.normalize_country(name), code, name)
+
+    def test_an_unknown_name_still_resolves_to_nothing_rather_than_a_guess(self):
+        self.assertEqual(sources.normalize_country("Atlantis"), "")
+
+
+class RepairingALabelAlreadyStored(unittest.TestCase):
+    def test_a_refresh_replaces_a_label_that_resolves_to_no_country(self):
+        merged = {"1.2.3.4:80": {"addr": "1.2.3.4:80", "kind": "http",
+                                 "country": "T\ufffdrkiye", "publishers": set()}}
+        entry = merged["1.2.3.4:80"]
+        country = "T\u00fcrkiye"
+        if country and (not entry["country"]
+                        or (not sources.normalize_country(entry["country"])
+                            and sources.normalize_country(country))):
+            entry["country"] = country
+        self.assertEqual(sources.normalize_country(entry["country"]), "TR")
+
+    def test_a_resolvable_label_is_not_overwritten_by_another_resolvable_one(self):
+        entry = {"country": "United States"}
+        country = "Canada"
+        if country and (not entry["country"]
+                        or (not sources.normalize_country(entry["country"])
+                            and sources.normalize_country(country))):
+            entry["country"] = country
+        self.assertEqual(entry["country"], "United States")
+
+
+class TheHostWideHarvestMutex(unittest.TestCase):
+    """One spender at a time, because the budgets are enforced in memory."""
+
+    def test_a_second_holder_is_refused_while_the_first_holds_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "harvest.lock"
+            with jsonstore.exclusive(path) as first:
+                self.assertTrue(first)
+                with jsonstore.exclusive(path, wait=False) as second:
+                    self.assertFalse(second)
+
+    def test_it_is_available_again_once_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "harvest.lock"
+            with jsonstore.exclusive(path):
+                pass
+            with jsonstore.exclusive(path, wait=False) as got:
+                self.assertTrue(got)
+
+    def test_the_default_lock_is_keyed_on_the_shared_store_not_the_caller(self):
+        lock = jsonstore.harvest_lock()
+        self.assertEqual(lock._path.parent, jsonstore.data_dir())
+        self.assertEqual(lock._path.name, "harvest.lock")
 
 
 if __name__ == "__main__":
