@@ -111,6 +111,16 @@ optional: **with `NO_PROXY=*` in the environment, both urllib and curl silently
 ignore an explicit proxy and connect directly**, so a rotating pool appears to
 work while every request leaves from the one address it exists to avoid.
 
+**Every address carries its country.** Only one of the sixteen lists labels
+geography, so the rest are resolved through ip-api.com (100 per call, no key) and
+persisted in the store - an address does not move, so the lookup is paid once
+ever. It matters because the endpoints these proxies are pointed at often answer
+differently per country, which makes an unlabelled result uninterpretable.
+Resolution happens *before* verification, not after: the pool fills in a
+background thread and callers start as soon as a handful of addresses answer, so
+labelling at the end would leave every early result unable to say where it came
+from.
+
 **Where addresses come from.** Sixteen published lists across ten publishers
 (`keel_crawler.proxy.sources`), returning ~14,000 entries that de-duplicate to
 ~8,400 addresses. Diversity is availability, not tidiness: two evaluated

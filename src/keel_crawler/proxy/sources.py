@@ -160,3 +160,42 @@ def fetch_all(sources: tuple[Source, ...] = SOURCES, timeout: float = 25.0,
     for entry in merged.values():
         entry["publishers"] = sorted(entry["publishers"])
     return merged
+
+
+# Where an address actually is. Only one of the sixteen lists labels country, so
+# the rest are resolved here. ip-api.com takes 100 addresses per call, needs no
+# key, and allows 45 calls a minute - and because an address does not move, a
+# lookup is paid once ever and then lives in the store.
+GEO_ENDPOINT = "http://ip-api.com/batch?fields=query,countryCode,status"
+GEO_BATCH = 100
+
+
+def geolocate(ips, timeout: float = 20.0, batch: int = GEO_BATCH) -> dict:
+    """Map addresses to ISO country codes. Never raises; unknown ones are absent.
+
+    Country matters here because the endpoints these proxies are pointed at
+    answer differently depending on where the request comes from, so a result
+    without its country is a result nobody can interpret.
+    """
+    import json
+    import urllib.request
+
+    found: dict[str, str] = {}
+    ips = [ip for ip in dict.fromkeys(ips) if ip]
+    for start in range(0, len(ips), batch):
+        chunk = ips[start:start + batch]
+        try:
+            request = urllib.request.Request(
+                GEO_ENDPOINT, data=json.dumps(chunk).encode(),
+                headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                rows = json.loads(response.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 - a country label is never worth failing a run
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("status") == "success":
+                code = (row.get("countryCode") or "").strip()
+                if code:
+                    found[row.get("query", "")] = code
+    return found

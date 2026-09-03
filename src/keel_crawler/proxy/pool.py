@@ -40,7 +40,8 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from keel_crawler.proxy.jsonstore import data_dir, locked
-from keel_crawler.proxy.sources import SOURCES, USER_AGENT, fetch_all
+from keel_crawler.proxy.sources import (SOURCES, USER_AGENT, fetch_all,
+                                        geolocate)
 
 # The ageing policy, stated in one place so it can be read without tracing
 # conditionals. Consecutive failed checks before an address is considered dead:
@@ -272,6 +273,41 @@ class ProxyStore:
                         record["status"] = DEAD
             self._save(handle, records)
 
+    def resolve_countries(self, addrs, progress=None) -> dict:
+        """Fill in the country of any address that does not have one yet.
+
+        Only one of the published lists labels country, so most addresses arrive
+        without one - and a result that cannot say where it came from is a result
+        nobody can interpret, on an endpoint that answers differently per country.
+        An address does not move, so this is paid once per address, ever, and read
+        from the store thereafter.
+        """
+        with locked(self.path) as handle:
+            records = self._load(handle)
+        known = {a: records[a]["country"] for a in addrs
+                 if a in records and records[a].get("country")}
+        missing = [a for a in addrs if a not in known]
+        if not missing:
+            return known
+
+        found = geolocate([a.split(":")[0] for a in missing])
+        if progress:
+            progress(f"proxy store: resolved {len(found):,} of {len(missing):,} "
+                     "previously unknown proxy countries")
+        if found:
+            with locked(self.path) as handle:
+                records = self._load(handle)
+                for addr in missing:
+                    code = found.get(addr.split(":")[0])
+                    if code and addr in records and not records[addr].get("country"):
+                        records[addr]["country"] = code
+                self._save(handle, records)
+            for addr in missing:
+                code = found.get(addr.split(":")[0])
+                if code:
+                    known[addr] = code
+        return known
+
     def record_blocked(self, addr: str, target: str) -> None:
         """Note that one target refused this address, without condemning it globally."""
         now = _now()
@@ -470,6 +506,17 @@ class ProxyPool:
                          f"{summary['new']:,} new, {summary['revived']:,} revived")
 
         batch = store.candidates(limit=candidates)
+
+        # Resolve country BEFORE verifying, not after. The pool fills in a
+        # background thread and the crawl starts the moment a handful of
+        # addresses answer, so labelling at the end would leave every early
+        # result unable to say where it came from. Doing it first costs one pass
+        # over addresses the store has not seen before, and never again.
+        labels = store.resolve_countries([p.addr for p in batch], progress=progress)
+        if labels:
+            batch = [Proxy(p.addr, p.kind, labels.get(p.addr) or p.country)
+                     for p in batch]
+
         target_text = "keeping every one that answers" if unlimited else f"filling to {want}"
         if progress:
             progress(f"proxy store: verifying up to {len(batch):,} candidates; "
