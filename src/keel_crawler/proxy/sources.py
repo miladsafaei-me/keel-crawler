@@ -17,8 +17,19 @@ Formats seen in the wild, all handled by :func:`parse`:
 * ``scheme://ip:port`` — proxifly and others prefix the protocol.
 * ``ip:port:Country`` — hideip.me appends metadata, which is a bonus rather
   than a nuisance: it is the only free source here that labels geography.
-* JSON with a ``data`` array — geonode's shape, kept because the source may be
-  reachable from other networks even though it is not from this one.
+* JSON with a ``data`` array — geonode's shape, which also carries the country
+  and the protocol per row.
+* An HTML table of ``<td>ip</td><td>port</td>`` — several sites publish nothing
+  else, and one GET plus a regex is cheaper than admitting a browser here.
+
+**A list that still downloads is not a list that is still maintained.** Two of
+the nine publishers this module started with had stopped committing — jetkai in
+April 2023, prxchk in April 2024 — and nothing ever failed, because their files
+are still served. Measured 2026-09-04, they published 2,056 addresses no other
+source had, 23.5% of the whole candidate pool, of which **2.8%** would even
+accept a TCP connection against 42.5% for everything else. They are gone from
+the list below, and the lesson is that a source is judged by its last commit
+date, not by whether the URL answers.
 """
 from __future__ import annotations
 
@@ -26,6 +37,7 @@ import json
 import re
 import urllib.request
 from dataclasses import dataclass
+from typing import NamedTuple
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) keel-crawler/proxy-pool"
 
@@ -42,75 +54,227 @@ class Source:
     publisher: str
 
 
-# Verified reachable and productive on 2026-09-02. Grouped by publisher so the
-# redundancy is visible: losing any one publisher costs at most two lists.
-SOURCES: tuple[Source, ...] = (
+# Verified reachable and productive on 2026-09-04: every URL fetched, parsed and
+# counted, with the addresses it publishes that no other source does. Grouped by
+# publisher so the redundancy is visible, and ordered within a group by what the
+# measurement said each file was worth. The full table, including what was
+# rejected and why, is in docs/proxy-sources.md.
+#
+# GitHub raw text and JSON. These are reachable from anywhere, including a laptop.
+GITHUB_SOURCES: tuple[Source, ...] = (
     Source("speedx-http", "http",
            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "TheSpeedX"),
     Source("speedx-socks5", "socks5",
            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "TheSpeedX"),
+    Source("speedx-socks4", "socks4",
+           "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt", "TheSpeedX"),
+    Source("tuanminpay-http", "http",
+           "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/http.txt", "TuanMinPay"),
+    Source("tuanminpay-socks5", "socks5",
+           "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/socks5.txt", "TuanMinPay"),
+    Source("xyzs996-http", "http",
+           "https://raw.githubusercontent.com/xyzs996/free-proxy-health-list/main/http.txt",
+           "xyzs996"),
+    Source("xyzs996-socks5", "socks5",
+           "https://raw.githubusercontent.com/xyzs996/free-proxy-health-list/main/socks5.txt",
+           "xyzs996"),
+    Source("dpangestuw-http", "http",
+           "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt",
+           "dpangestuw"),
+    Source("dpangestuw-socks5", "socks5",
+           "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks5_proxies.txt",
+           "dpangestuw"),
     Source("proxifly-all", "http",
            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
            "proxifly"),
     Source("sunny9577-http", "http",
            "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
            "sunny9577"),
-    Source("jetkai-http", "http",
-           "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
-           "jetkai"),
-    Source("jetkai-socks5", "socks5",
-           "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
-           "jetkai"),
+    Source("sunny9577-socks5", "socks5",
+           "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks5_proxies.txt",
+           "sunny9577"),
+    Source("sunny9577-socks4", "socks4",
+           "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks4_proxies.txt",
+           "sunny9577"),
     Source("monosans-http", "http",
            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "monosans"),
     Source("monosans-socks5", "socks5",
            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", "monosans"),
+    # Scheme-prefixed and genuinely mixed: the protocol is read per line, not
+    # taken from this entry.
+    Source("monosans-all", "http",
+           "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt", "monosans"),
+    Source("aliilapro-http", "http",
+           "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt", "ALIILAPRO"),
+    Source("aliilapro-socks5", "socks5",
+           "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt", "ALIILAPRO"),
+    Source("aliilapro-socks4", "socks4",
+           "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt", "ALIILAPRO"),
+    Source("mrmarble-all", "http",
+           "https://raw.githubusercontent.com/MrMarble/proxy-list/main/all.txt", "MrMarble"),
+    # Published as already-checked subsets rather than raw scrapes.
+    Source("nikolait-http", "http",
+           "https://raw.githubusercontent.com/NikolaiT/free-proxy-list/main/proxies/http_working.txt",
+           "NikolaiT"),
+    Source("nikolait-socks5", "socks5",
+           "https://raw.githubusercontent.com/NikolaiT/free-proxy-list/main/proxies/socks5_working.txt",
+           "NikolaiT"),
+    Source("nikolait-socks4", "socks4",
+           "https://raw.githubusercontent.com/NikolaiT/free-proxy-list/main/proxies/socks4_working.txt",
+           "NikolaiT"),
+    Source("elliott-mix-checked", "http",
+           "https://raw.githubusercontent.com/elliottophellia/proxylist/master/results/mix_checked.txt",
+           "elliottophellia"),
+    Source("zaeem20-http", "http",
+           "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt", "Zaeem20"),
+    Source("zaeem20-socks5", "socks5",
+           "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt", "Zaeem20"),
+    Source("zaeem20-socks4", "socks4",
+           "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt", "Zaeem20"),
     Source("vakhov-http", "http",
            "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt", "vakhov"),
     Source("vakhov-socks5", "socks5",
            "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt", "vakhov"),
     Source("hookzof-socks5", "socks5",
            "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", "hookzof"),
-    Source("prxchk-http", "http",
-           "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt", "prxchk"),
-    Source("prxchk-socks5", "socks5",
-           "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt", "prxchk"),
     Source("roosterkid-socks5", "socks5",
            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
            "roosterkid"),
-    # The only free source that labels country, via a third colon-separated field.
+    Source("roosterkid-socks4", "socks4",
+           "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+           "roosterkid"),
+    Source("themiralay-all", "http",
+           "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
+           "themiralay"),
+    Source("thordata-highanon", "http",
+           "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/high-anon.txt",
+           "Thordata"),
+    Source("thordata-stable", "http",
+           "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/stable.txt",
+           "Thordata"),
+    # The three files that label country. connect.txt is the largest of them and
+    # was published for years before anyone here read it.
+    Source("hideip-connect", "http",
+           "https://raw.githubusercontent.com/zloi-user/hideip.me/main/connect.txt", "hideip.me"),
+    Source("hideip-https", "http",
+           "https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt", "hideip.me"),
     Source("hideip-http", "http",
            "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt", "hideip.me"),
     Source("hideip-socks5", "socks5",
            "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt", "hideip.me"),
+    Source("watchttvv-socks5", "socks5",
+           "https://raw.githubusercontent.com/watchttvv/free-proxy-list/main/proxy.txt", "watchttvv"),
 )
 
+# Sites and keyless APIs. **These are not reachable from every network.** Measured
+# 2026-09-04, essentially every proxy-list domain fails the TLS handshake at SNI
+# from one laptop while google.com and github.com answer normally from the same
+# shell; the same URLs answer 200 from the production harvest host. So a source
+# here that returns nothing locally has not been proven dead - which is exactly
+# the mistake that recorded proxyscrape and geonode as "unroutable" when this
+# module was written. Judge them from the machine that will do the harvesting.
+WEB_SOURCES: tuple[Source, ...] = (
+    # Six pages of 500. The only source that labels country for every row and
+    # names the protocol, so it is worth the six requests.
+    *(Source(f"geonode-p{page}", "http",
+             "https://proxylist.geonode.com/api/proxy-list?limit=500&page="
+             f"{page}&sort_by=lastChecked&sort_type=desc", "geonode")
+      for page in range(1, 7)),
+    Source("proxyscrape-v4", "http",
+           "https://api.proxyscrape.com/v4/free-proxy-list/get"
+           "?request=display_proxies&proxy_format=protocolipport&format=text", "proxyscrape"),
+    Source("spysme-http", "http", "https://spys.me/proxy.txt", "spys.me"),
+    Source("spysme-socks", "socks5", "https://spys.me/socks.txt", "spys.me"),
+    Source("socks-proxy-net", "socks5", "https://www.socks-proxy.net/", "free-proxy-list.net"),
+    Source("free-proxy-list-net", "http", "https://free-proxy-list.net/", "free-proxy-list.net"),
+    Source("hide-mn", "http", "https://hide.mn/en/proxy-list/", "hide.mn"),
+    Source("flamingoproxies", "http", "https://flamingoproxies.com/free-proxies",
+           "flamingoproxies"),
+    Source("premiumproxy", "http", "https://premiumproxy.net/", "premiumproxy"),
+    Source("freeproxyupdate", "http", "https://freeproxyupdate.com/", "freeproxyupdate"),
+)
 
-def parse(text: str) -> list[tuple[str, str]]:
-    """Read any of the published formats into (addr, country) pairs.
+SOURCES: tuple[Source, ...] = GITHUB_SOURCES + WEB_SOURCES
 
-    Country is "" when the source does not say, which is all of them but one.
+
+# A protocol named on the line itself beats the one the source is filed under: a
+# "mixed" list carries all three, and calling a socks5 address http means every
+# request through it fails for a reason no log explains.
+_SCHEMES = {"http": "http", "https": "http", "socks4": "socks4",
+            "socks4a": "socks4", "socks5": "socks5", "socks5h": "socks5"}
+
+_TABLE_ROW = re.compile(
+    r"<td[^>]*>\s*(\d{1,3}(?:\.\d{1,3}){3})\s*</td>\s*<td[^>]*>\s*(\d{2,5})\s*</td>"
+    r"(?:\s*<td[^>]*>\s*([A-Za-z]{2})\s*</td>)?",
+    re.I)
+
+
+class Row(NamedTuple):
+    """One address as a source published it."""
+
+    addr: str
+    country: str = ""
+    kind: str = "http"
+
+
+def _rows_from_json(text: str, default_kind: str) -> list[Row]:
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return []
+    rows = payload.get("data", []) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    found = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ip, port = row.get("ip"), row.get("port")
+        if not (ip and port):
+            continue
+        protocols = row.get("protocols") or []
+        kind = _SCHEMES.get(str(protocols[0]).lower(), default_kind) if protocols else default_kind
+        found.append(Row(f"{ip}:{port}", (row.get("country") or "").strip(), kind))
+    return found
+
+
+def _rows_from_html(text: str, default_kind: str) -> list[Row]:
+    """Read the ``<td>ip</td><td>port</td>`` tables several sites publish.
+
+    A regex rather than a parser, and a browser least of all: these tables are
+    server-rendered and two cells wide at the point that matters, so the cheap
+    read is also the complete one. A site that changes shape yields nothing,
+    which is the same outcome as a site that goes down and is handled the same
+    way — skipped, with the rest of the refresh unaffected.
+    """
+    found = []
+    for ip, port, code in _TABLE_ROW.findall(text):
+        found.append(Row(f"{ip}:{port}", (code or "").upper(), default_kind))
+    return found
+
+
+def parse(text: str, default_kind: str = "http") -> list[Row]:
+    """Read any of the published formats into rows.
+
+    ``country`` is "" when the source does not say, which is most of them, and
+    ``kind`` falls back to the source's own protocol when the line does not name
+    one.
     """
     text = text.strip()
-    if text.startswith("{"):
-        try:
-            rows = json.loads(text).get("data", [])
-        except (ValueError, AttributeError):
-            return []
-        found = []
-        for row in rows:
-            ip, port = row.get("ip"), row.get("port")
-            if ip and port:
-                found.append((f"{ip}:{port}", (row.get("country") or "").strip()))
-        return found
+    if text.startswith("{") or text.startswith("["):
+        return _rows_from_json(text, default_kind)
+    if "<td" in text[:200000].lower():
+        return _rows_from_html(text, default_kind)
 
     found = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        kind = default_kind
         if "://" in line:
-            line = line.split("://", 1)[1]
+            scheme, _, line = line.partition("://")
+            kind = _SCHEMES.get(scheme.strip().lower(), default_kind)
         # Split on colons before whitespace, not after: the country field can
         # contain a space ("United States"), so trimming at the first space
         # would silently truncate every multi-word country to its first word.
@@ -122,7 +286,7 @@ def parse(text: str) -> list[tuple[str, str]]:
         country = ":".join(fields[2:]).strip() if len(fields) > 2 else ""
         addr = f"{host}:{port}"
         if _IPPORT.match(addr):
-            found.append((addr, country))
+            found.append(Row(addr, country, kind))
     return found
 
 
@@ -143,12 +307,12 @@ def decode(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def fetch(source: Source, timeout: float = 25.0) -> list[tuple[str, str]]:
+def fetch(source: Source, timeout: float = 25.0) -> list[Row]:
     """Pull and parse one list. Never raises — a dead source yields nothing."""
     try:
         request = urllib.request.Request(source.url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return parse(decode(response.read()))
+            return parse(decode(response.read()), source.kind)
     except Exception:  # noqa: BLE001 - one dead list must not end a refresh
         return []
 
@@ -166,9 +330,9 @@ def fetch_all(sources: tuple[Source, ...] = SOURCES, timeout: float = 25.0,
     merged: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for source, rows in zip(sources, pool.map(lambda s: fetch(s, timeout), sources)):
-            for addr, country in rows:
+            for addr, country, kind in rows:
                 entry = merged.setdefault(
-                    addr, {"addr": addr, "kind": source.kind, "country": country,
+                    addr, {"addr": addr, "kind": kind, "country": country,
                            "publishers": set()}
                 )
                 entry["publishers"].add(source.publisher)
@@ -186,7 +350,7 @@ def fetch_all(sources: tuple[Source, ...] = SOURCES, timeout: float = 25.0,
     return merged
 
 
-# Where an address actually is. Only one of the sixteen lists labels country, so
+# Where an address actually is. Only a handful of the lists label country, so
 # the rest are resolved here. ip-api.com takes 100 addresses per call, needs no
 # key, and allows 45 calls a minute - and because an address does not move, a
 # lookup is paid once ever and then lives in the store.

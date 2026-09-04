@@ -17,6 +17,7 @@ from keel_crawler.proxy.pool import (BLOCK_MEMORY_SECONDS, DEAD, DEAD_MEMORY_SEC
                                      FAILURE_LIMIT, LIVE, STALE_LIVE_SECONDS,
                                      UNVERIFIED, UNVERIFIED_TTL_SECONDS, Budget,
                                      Proxy, ProxyPool, ProxyStore)
+from keel_crawler.proxy import pool as pool_module
 from keel_crawler.proxy import sources
 from keel_crawler.proxy.sources import SOURCES, parse
 
@@ -28,28 +29,65 @@ class SourceParsingTests(unittest.TestCase):
 
     def test_plain_ip_port(self):
         self.assertEqual(parse("1.2.3.4:8080\n5.6.7.8:1080"),
-                         [("1.2.3.4:8080", ""), ("5.6.7.8:1080", "")])
+                         [("1.2.3.4:8080", "", "http"), ("5.6.7.8:1080", "", "http")])
 
     def test_scheme_prefixed_lines(self):
-        self.assertEqual(parse("socks5://1.2.3.4:1080"), [("1.2.3.4:1080", "")])
+        self.assertEqual(parse("socks5://1.2.3.4:1080"), [("1.2.3.4:1080", "", "socks5")])
+
+    def test_a_line_naming_its_protocol_overrides_the_source_default(self):
+        """A "mixed" list carries all three, and the line is the only honest say."""
+        rows = parse("socks5://1.2.3.4:1080\n9.9.9.9:80", default_kind="http")
+        self.assertEqual([row.kind for row in rows], ["socks5", "http"])
+
+    def test_a_source_default_applies_where_the_line_is_silent(self):
+        self.assertEqual(parse("1.2.3.4:1080", default_kind="socks4")[0].kind, "socks4")
 
     def test_country_annotated_lines_keep_the_country(self):
         self.assertEqual(parse("24.72.215.236:8246:United States"),
-                         [("24.72.215.236:8246", "United States")])
+                         [("24.72.215.236:8246", "United States", "http")])
 
     def test_json_shape(self):
         blob = json.dumps({"data": [{"ip": "1.2.3.4", "port": "80", "country": "DE"}]})
-        self.assertEqual(parse(blob), [("1.2.3.4:80", "DE")])
+        self.assertEqual(parse(blob), [("1.2.3.4:80", "DE", "http")])
+
+    def test_json_rows_can_name_their_own_protocol(self):
+        blob = json.dumps({"data": [{"ip": "1.2.3.4", "port": "80",
+                                     "country": "DE", "protocols": ["socks5"]}]})
+        self.assertEqual(parse(blob)[0].kind, "socks5")
+
+    def test_an_html_table_of_addresses_is_read(self):
+        """Several sites publish nothing but a server-rendered table."""
+        html = ("<table><tr><td>1.2.3.4</td><td>8080</td><td>US</td></tr>"
+                "<tr><td>5.6.7.8</td><td>3128</td><td>DE</td></tr></table>")
+        self.assertEqual(parse(html),
+                         [("1.2.3.4:8080", "US", "http"), ("5.6.7.8:3128", "DE", "http")])
 
     def test_junk_and_hostnames_are_ignored(self):
         self.assertEqual(parse("# comment\n\nnot-an-ip:80\nexample.com:8080\n1.2.3.4:80"),
-                         [("1.2.3.4:80", "")])
+                         [("1.2.3.4:80", "", "http")])
 
     def test_no_single_publisher_can_take_the_pool_down(self):
         publishers = {s.publisher for s in SOURCES}
         self.assertGreaterEqual(len(publishers), 5,
                                 "diversity is the point: one publisher going stale "
                                 "must not end a harvest")
+
+    def test_the_publishers_that_stopped_committing_are_gone(self):
+        """A list that still downloads is not a list that is still maintained.
+
+        jetkai stopped committing in April 2023 and prxchk in April 2024, and
+        between them they were still serving 2,056 addresses no other source
+        had, 2.8% of which would accept a TCP connection.
+        """
+        publishers = {s.publisher for s in SOURCES}
+        self.assertNotIn("jetkai", publishers)
+        self.assertNotIn("prxchk", publishers)
+
+    def test_every_source_is_named_and_addressed_once(self):
+        names = [s.name for s in SOURCES]
+        urls = [s.url for s in SOURCES]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(len(urls), len(set(urls)))
 
 
 class StoreTests(unittest.TestCase):
@@ -205,7 +243,12 @@ class RotationTests(unittest.TestCase):
 
     def test_socks_addresses_resolve_dns_at_the_proxy(self):
         self.assertTrue(Proxy("1.2.3.4:1080", "socks5").url.startswith("socks5h://"))
+        self.assertTrue(Proxy("1.2.3.4:1080", "socks4").url.startswith("socks4a://"))
         self.assertTrue(Proxy("1.2.3.4:8080", "http").url.startswith("http://"))
+
+    def test_an_unknown_protocol_is_spoken_to_as_http(self):
+        """Which is what a list that says nothing about protocol means."""
+        self.assertTrue(Proxy("1.2.3.4:8080", "gopher").url.startswith("http://"))
 
     def test_work_spreads_over_the_pool(self):
         pool = self.pool(4)
@@ -451,6 +494,137 @@ class TheHostWideHarvestMutex(unittest.TestCase):
         lock = jsonstore.harvest_lock()
         self.assertEqual(lock._path.parent, jsonstore.data_dir())
         self.assertEqual(lock._path.name, "harvest.lock")
+
+
+
+
+class FakeStore:
+    """A store that hands out addresses in order and remembers what was asked.
+
+    Enough of ProxyStore for the refill loop: the loop only ever asks for
+    candidates, records outcomes, and re-reads the published lists.
+    """
+
+    def __init__(self, addrs):
+        self.addrs = list(addrs)
+        self.recorded = {}
+        self.refreshes = 0
+        self.asked_exclusions = []
+
+    def candidates(self, limit=1000, kinds=None, exclude=()):
+        exclude = set(exclude)
+        self.asked_exclusions.append(exclude)
+        return [Proxy(a, "http") for a in self.addrs if a not in exclude][:limit]
+
+    def record_result(self, results, target=""):
+        self.recorded.update(results)
+
+    def refresh(self, sources=None):
+        self.refreshes += 1
+        return {"published": 0, "new": 0, "revived": 0, "total": 0}
+
+
+class RefillTests(unittest.TestCase):
+    """A pool that only ever shrinks is a crawl with a deadline nobody set.
+
+    Measured 2026-09-04: one harvest filled to 156 addresses and finished
+    thirteen minutes later with 58, because verification was a single pass and
+    nothing ever added an address back.
+    """
+
+    def setUp(self):
+        self.answered = set()
+        self.original = pool_module.fetch_through
+        pool_module.fetch_through = self.fake_fetch
+        self.addCleanup(setattr, pool_module, "fetch_through", self.original)
+
+    def fake_fetch(self, proxy, url, timeout=10.0):
+        return (200, "ok") if proxy.addr in self.answered else (0, "")
+
+    def build(self, addrs, answering, **cfg):
+        store = FakeStore(addrs)
+        self.answered = set(answering)
+        pool = ProxyPool(live=[], store=store, target="example.com",
+                         rps=1000.0, per_minute=0, per_hour=0)
+        pool._verify_cfg = {
+            "probe_url": "https://example.com/", "workers": 4, "timeout": 1.0,
+            "accept": lambda status, body: status == 200, "want": 0,
+            "unlimited": True, "candidates": 100, "progress": None,
+            "refill": True, "refill_share": 0.5, "refill_budget": 10_000,
+            "refresh_after": 3600.0, "start_at": 1,
+        }
+        pool._verify_cfg.update(cfg)
+        pool._last_refresh = time.monotonic()
+        return pool, store
+
+    def test_a_refill_admits_addresses_while_the_crawl_runs(self):
+        pool, _ = self.build(["1.1.1.1:80", "2.2.2.2:80"],
+                             answering=["1.1.1.1:80", "2.2.2.2:80"])
+        self.assertEqual(pool.refill_once(), 2)
+        self.assertEqual(len(pool), 2)
+        self.assertEqual(pool.refills, 1)
+
+    def test_a_refill_never_re_checks_what_this_run_already_spent_a_check_on(self):
+        pool, store = self.build(["1.1.1.1:80", "2.2.2.2:80"], answering=["2.2.2.2:80"])
+        pool._tried = {"1.1.1.1:80"}
+        pool.refill_once()
+        self.assertIn("1.1.1.1:80", store.asked_exclusions[0])
+        self.assertNotIn("1.1.1.1:80", store.recorded)
+
+    def test_a_second_refill_excludes_what_the_first_one_checked(self):
+        pool, store = self.build(["1.1.1.1:80", "2.2.2.2:80"], answering=[])
+        pool.refill_once()
+        pool.refill_once()
+        self.assertEqual(store.asked_exclusions[-1], {"1.1.1.1:80", "2.2.2.2:80"})
+
+    def test_a_refill_with_nothing_left_to_offer_reports_zero(self):
+        pool, _ = self.build([], answering=[])
+        self.assertEqual(pool.refill_once(), 0)
+        self.assertEqual(pool.refills, 0)
+
+    def test_the_watermark_follows_the_pool_high_water_mark(self):
+        pool, _ = self.build([f"10.0.0.{i}:80" for i in range(10)],
+                             answering=[f"10.0.0.{i}:80" for i in range(10)])
+        pool.refill_once()
+        self.assertEqual(len(pool), 10)
+        self.assertEqual(pool.refill_at(), 5)
+
+    def test_the_watermark_never_falls_below_the_pool_that_can_start_a_crawl(self):
+        pool, _ = self.build(["1.1.1.1:80"], answering=["1.1.1.1:80"], start_at=8)
+        pool.refill_once()
+        self.assertEqual(pool.refill_at(), 8)
+
+    def test_the_published_lists_are_re_read_only_once_they_are_stale(self):
+        pool, store = self.build(["1.1.1.1:80"], answering=[], refresh_after=3600.0)
+        pool.refill_once()
+        self.assertEqual(store.refreshes, 0)
+        pool._last_refresh = time.monotonic() - 3601
+        pool._tried.clear()
+        pool.refill_once()
+        self.assertEqual(store.refreshes, 1)
+
+    def test_every_candidate_checked_is_counted_against_the_run_budget(self):
+        pool, _ = self.build(["1.1.1.1:80", "2.2.2.2:80"], answering=[])
+        pool.refill_once()
+        self.assertEqual(pool.verified_total, 2)
+        self.assertEqual(pool.stats()["verified_total"], 2)
+        self.assertEqual(pool.stats()["refills"], 1)
+
+    def test_a_pool_built_without_a_store_simply_does_not_refill(self):
+        pool = ProxyPool(live=[])
+        self.assertEqual(pool.refill_once(), 0)
+
+    def test_maintenance_stops_when_asked(self):
+        pool, _ = self.build(["1.1.1.1:80"], answering=["1.1.1.1:80"])
+        pool.stop()
+        pool._maintain()  # returns immediately rather than looping
+
+    def test_refill_can_be_turned_off_at_build(self):
+        import inspect
+
+        signature = inspect.signature(ProxyPool.build).parameters
+        self.assertTrue(signature["refill"].default,
+                        "a pool that never refills is the bug this replaced")
 
 
 if __name__ == "__main__":

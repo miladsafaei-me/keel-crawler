@@ -18,8 +18,8 @@ than buried in conditionals.
 with a per-address budget on three timescales so a pool stays usable instead of
 burning itself down in one run.
 
-:mod:`keel_crawler.proxy.sources` is where addresses come from: sixteen lists
-across nine publishers, so no single one going stale stops the work.
+:mod:`keel_crawler.proxy.sources` is where addresses come from: fifty-five lists
+across twenty-seven publishers, so no single one going stale stops the work.
 
 **Liveness is per target, not global.** A proxy refused by one site may serve
 another perfectly well, so a refusal is recorded against the target that issued
@@ -90,6 +90,31 @@ MAX_RECORDS = 20_000
 # is set to exactly the largest volume actually tested per address rather than
 # extrapolated, because the test found a floor, not a ceiling: nothing blocked,
 # so the true limit is somewhere above this and remains unknown.
+# How the pool keeps itself alive once a crawl is under way. Verification used to
+# be a single pass: check a batch, admit what answers, and never look again. That
+# makes a pool strictly one-way — `report_failure` and `report_blocked` remove
+# addresses and nothing adds any — so a long harvest decays for hours. Measured
+# 2026-09-04: one run filled to 156 addresses and ended thirteen minutes later
+# with 58; a second filled to 600 and spent the following hours shrinking, having
+# stopped checking with about 3,000 already-ranked candidates untouched because
+# it had reached its `want`.
+#
+# So the pool watches itself and refills. The trigger is the live count, not
+# throughput: throughput is confounded by the caller's own response cache, which
+# replays a whole level of work with zero network calls and would read as a
+# healthy pool at the exact moment the pool was emptying.
+REFILL_CHECK_SECONDS = 15.0
+# Refill when the pool falls to this share of its own high-water mark. Relative,
+# because `want` is often 0 ("keep everything that answers") and a fixed floor
+# would be either meaningless for a pool of 600 or unreachable for a pool of 20.
+REFILL_SHARE = 0.5
+# A refill pass that finds nothing waits longer before the next one, up to this.
+REFILL_BACKOFF_MAX = 900.0
+# The published lists commit five to seven times a day, so re-reading them more
+# often than this buys nothing; re-reading them never is what leaves a
+# twelve-hour run working from the addresses that existed when it started.
+REFRESH_AFTER_SECONDS = 7200.0
+
 PER_PROXY_RPS = 1.5
 PER_PROXY_PER_MINUTE = 90
 PER_PROXY_PER_HOUR = 1500
@@ -111,11 +136,15 @@ class Proxy:
     kind: str = "http"
     country: str = ""
 
+    # socks5h and socks4a, not socks5 and socks4: both spellings resolve DNS at
+    # the proxy, so the lookup is neither leaked to nor answered by the local
+    # network. Anything unrecognised is spoken to as HTTP, which is what the
+    # published lists mean when they say nothing.
+    SCHEMES = {"socks5": "socks5h", "socks4": "socks4a"}
+
     @property
     def url(self) -> str:
-        # socks5h, not socks5: the "h" resolves DNS at the proxy, so the lookup
-        # is neither leaked to nor answered by the local network.
-        return f"{'socks5h' if self.kind == 'socks5' else 'http'}://{self.addr}"
+        return f"{self.SCHEMES.get(self.kind, 'http')}://{self.addr}"
 
 
 def fetch_through(proxy: Proxy, url: str, timeout: float = 10.0) -> tuple[int, str]:
@@ -218,13 +247,18 @@ class ProxyStore:
         return {"published": len(found), "new": added, "revived": revived,
                 "known_before": known_before}
 
-    def candidates(self, limit: int = 1000, kinds=("http", "socks5")) -> list:
+    def candidates(self, limit: int = 1000, kinds=("http", "socks5", "socks4"),
+                   exclude=()) -> list:
         """What to check next, best-evidence first.
 
         Ordering is deliberate. Addresses already known to work come first so a
         crawl can start immediately; then unverified ones, most-published first,
         because several independent lists agreeing is the only quality signal
         available before a check is spent.
+
+        ``exclude`` skips addresses a caller has already spent a check on. A
+        refilling pool asks for its next batch repeatedly, and without this it
+        would be handed the same best-ranked corpses every time.
         """
         now = _now()
         with locked(self.path) as handle:
@@ -235,9 +269,10 @@ class ProxyStore:
             status_rank = {LIVE: 0, UNVERIFIED: 1, DEAD: 2}.get(record.get("status"), 3)
             return (status_rank, -len(record.get("publishers", [])), -record.get("last_ok", 0.0))
 
+        exclude = set(exclude)
         out = []
         for addr, record in sorted(records.items(), key=rank):
-            if record.get("kind") not in kinds:
+            if record.get("kind") not in kinds or addr in exclude:
                 continue
             if (record.get("status") == DEAD
                     and now - record.get("last_checked", 0) < DEAD_MEMORY_SECONDS):
@@ -433,10 +468,22 @@ class ProxyPool:
     # True while the background verifier is still adding addresses. It changes
     # what an empty pool means: not "no egress left", but "none ready yet".
     filling: bool = False
+    # Refills performed, and every candidate checked across all of them. The
+    # first is how a log shows the pool healing itself; the second is what the
+    # runaway guard counts.
+    refills: int = 0
+    verified_total: int = 0
     _failures: dict = field(default_factory=dict)
     _budgets: dict = field(default_factory=dict)
     _busy: set = field(default_factory=set)
     _lock: threading.Condition = field(default_factory=threading.Condition)
+
+    # Set by build(); a pool constructed directly simply never refills.
+    _verify_cfg: dict = field(default_factory=dict)
+    _tried: set = field(default_factory=set)
+    _high_water: int = 0
+    _last_refresh: float = 0.0
+    _closed: threading.Event = field(default_factory=threading.Event)
 
     def __post_init__(self) -> None:
         for proxy in self.live:
@@ -471,6 +518,8 @@ class ProxyPool:
               store: ProxyStore | None = None, accept=looks_usable, refresh: bool = True,
               target: str = "", rps: float = PER_PROXY_RPS,
               per_minute: int = PER_PROXY_PER_MINUTE, per_hour: int = PER_PROXY_PER_HOUR,
+              refill: bool = True, refill_share: float = REFILL_SHARE,
+              refill_budget: int = 0, refresh_after: float = REFRESH_AFTER_SECONDS,
               progress=None) -> "ProxyPool":
         """Start as soon as a few addresses answer, and keep filling in the background.
 
@@ -489,6 +538,14 @@ class ProxyPool:
         Every outcome is still written back to the store, so this remains the
         mechanism that keeps the file healthy — promoting what worked, condemning
         what did not, pruning what aged out — with no separate maintenance job.
+
+        **And it keeps filling for as long as the pool is used.** Once the first
+        pass ends, a maintenance thread watches the live count and starts another
+        pass whenever it falls to ``refill_share`` of its high-water mark, taking
+        the candidates the last pass did not reach and re-reading the published
+        lists when they are older than ``refresh_after``. ``refill_budget`` caps
+        the candidates one run may check in total (0 derives one from
+        ``candidates``); ``refill=False`` restores the old single-pass behaviour.
         """
         from concurrent.futures import ThreadPoolExecutor
 
@@ -530,39 +587,33 @@ class ProxyPool:
 
         pool = cls(live=[], target=target, store=store, rps=rps,
                    per_minute=per_minute, per_hour=per_hour)
-        results: dict = {}
+        pool._verify_cfg = {
+            "probe_url": probe_url, "workers": workers, "timeout": timeout,
+            "accept": accept, "want": want, "unlimited": unlimited,
+            "candidates": candidates, "progress": progress,
+            "refill": refill, "refill_share": refill_share,
+            "refill_budget": refill_budget or max(candidates * 5, 5000),
+            "refresh_after": refresh_after, "start_at": start_at,
+        }
+        pool._tried = {proxy.addr for proxy in batch}
+        pool._last_refresh = time.monotonic()
         finished = threading.Event()
-
-        def check(proxy):
-            status, body = fetch_through(proxy, probe_url, timeout)
-            return proxy, status, body
 
         def verify_all():
             try:
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    for proxy, status, body in executor.map(check, batch):
-                        ok = accept(status, body)
-                        results[proxy.addr] = ok
-                        if ok:
-                            pool.add(proxy)
-                            if not unlimited and len(pool) >= want:
-                                break
+                pool._verify(batch)
             finally:
-                # Record even on an early exit: outcomes already gathered are the
-                # only thing that makes the next build faster.
-                try:
-                    store.record_result(dict(results), target=target)
-                except Exception:  # noqa: BLE001 - never kill a crawl over bookkeeping
-                    pass
-                pool.validated_from = len(results)
+                pool.validated_from = pool.verified_total
                 pool.filling = False
                 finished.set()
                 if progress:
-                    checked = len(results)
+                    checked = pool.verified_total
                     progress(f"proxy pool: filled to {len(pool)} from {checked} checked "
                              f"({100 * len(pool) / max(1, checked):.1f}% usable) — "
                              f"ceiling ≈ {len(pool) * rps:.0f} req/s, "
                              f"{len(pool) * per_hour:,}/hour")
+                if refill:
+                    pool._start_maintenance()
 
         pool.filling = True
         threading.Thread(target=verify_all, name="proxy-pool-fill", daemon=True).start()
@@ -574,6 +625,134 @@ class ProxyPool:
             progress(f"proxy pool: {len(pool)} address(es) ready — starting now, "
                      f"{target_text} in the background")
         return pool
+
+    def _verify(self, batch) -> int:
+        """Check a batch of candidates and admit every one that answers.
+
+        Shared by the first pass and by every refill, so an address admitted an
+        hour into a crawl went through exactly the same test as one admitted at
+        the start. Returns how many joined the pool.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        cfg = self._verify_cfg
+        results: dict = {}
+        before = len(self)
+
+        def check(proxy):
+            status, body = fetch_through(proxy, cfg["probe_url"], cfg["timeout"])
+            return proxy, status, body
+
+        try:
+            with ThreadPoolExecutor(max_workers=cfg["workers"]) as executor:
+                for proxy, status, body in executor.map(check, batch):
+                    ok = cfg["accept"](status, body)
+                    results[proxy.addr] = ok
+                    if ok:
+                        self.add(proxy)
+                        if not cfg["unlimited"] and len(self) >= cfg["want"]:
+                            break
+        finally:
+            # Record even on an early exit: outcomes already gathered are the
+            # only thing that makes the next build faster.
+            try:
+                if self.store is not None:
+                    self.store.record_result(dict(results), target=self.target)
+            except Exception:  # noqa: BLE001 - never kill a crawl over bookkeeping
+                pass
+            self.verified_total += len(results)
+            with self._lock:
+                self._high_water = max(self._high_water, len(self.live))
+        return len(self) - before
+
+    def refill_at(self) -> int:
+        """The live count at which another verification pass is worth starting.
+
+        Relative to the pool's own high-water mark rather than to ``want``:
+        ``want`` is commonly 0, meaning "keep everything that answers", and a
+        fixed floor would be either trivial for a pool of six hundred or
+        unreachable for a pool of twenty. Never below ``start_at``, because a
+        pool that small is one bad minute from being a dead end.
+        """
+        cfg = self._verify_cfg
+        share = cfg.get("refill_share", REFILL_SHARE)
+        return max(int(cfg.get("start_at", 1)), int(self._high_water * share))
+
+    def refill_once(self) -> int:
+        """One refill pass: re-read the lists if they are stale, then verify.
+
+        Public because it is the whole mechanism, and a caller that would rather
+        drive it itself — a test, or a scheduler — should not have to reach for
+        a private name.
+        """
+        cfg = self._verify_cfg
+        store = self.store
+        if store is None or not cfg:
+            return 0
+        progress = cfg.get("progress")
+        now = time.monotonic()
+        if now - self._last_refresh >= cfg["refresh_after"]:
+            # The lists have moved on since this run started. Cheap, and the only
+            # way a long crawl ever sees an address published after it began.
+            try:
+                summary = store.refresh()
+                if progress:
+                    progress(f"proxy store: refreshed mid-run — {summary['new']:,} new, "
+                             f"{summary['revived']:,} revived")
+            except Exception:  # noqa: BLE001 - a failed refresh must not end a crawl
+                pass
+            self._last_refresh = now
+        batch = store.candidates(limit=cfg["candidates"], exclude=self._tried)
+        if not batch:
+            return 0
+        self._tried.update(proxy.addr for proxy in batch)
+        self.filling = True
+        try:
+            added = self._verify(batch)
+        finally:
+            self.filling = False
+            with self._lock:
+                self._lock.notify_all()
+        self.refills += 1
+        if progress:
+            progress(f"proxy pool: refill {self.refills} added {added} — "
+                     f"{len(self)} live, {self.verified_total:,} checked in total")
+        return added
+
+    def _start_maintenance(self) -> None:
+        with self._lock:
+            self._high_water = max(self._high_water, len(self.live))
+        threading.Thread(target=self._maintain, name="proxy-pool-maintain",
+                         daemon=True).start()
+
+    def _maintain(self) -> None:
+        """Watch the live count and refill when it falls, until the run ends.
+
+        A daemon thread, so it never keeps a process alive; and it stops on its
+        own once the store has nothing left to offer or the run has spent its
+        candidate budget, rather than spinning against an exhausted store.
+        """
+        cfg = self._verify_cfg
+        interval = REFILL_CHECK_SECONDS
+        while not self._closed.wait(interval):
+            if self.filling or len(self) > self.refill_at():
+                interval = REFILL_CHECK_SECONDS
+                continue
+            if self.verified_total >= cfg["refill_budget"]:
+                progress = cfg.get("progress")
+                if progress:
+                    progress(f"proxy pool: refill budget spent "
+                             f"({self.verified_total:,} candidates checked)")
+                return
+            added = self.refill_once()
+            # A pass that found nothing means the store is thin right now, not
+            # that it will be thin in ten minutes: back off rather than stop.
+            interval = (REFILL_CHECK_SECONDS if added
+                        else min(interval * 2, REFILL_BACKOFF_MAX))
+
+    def stop(self) -> None:
+        """End maintenance. Safe to call more than once, and safe never to call."""
+        self._closed.set()
 
     def acquire(self, max_wait: float = 120.0):
         """Hand out the most-rested idle address, waiting if every one is spending.
@@ -673,6 +852,8 @@ class ProxyPool:
                 "retired_unreliable": self.retired,
                 "requests_served": self.served,
                 "still_filling": self.filling,
+                "refills": self.refills,
+                "verified_total": self.verified_total,
                 "target": self.target,
                 "per_proxy_limits": {"per_second": self.rps, "per_minute": self.per_minute,
                                      "per_hour": self.per_hour},

@@ -2,7 +2,7 @@
 
 **A pool of public addresses** (:mod:`keel_crawler.proxy.pool`) — for when the
 answer to "we are blocked" is *use a different IP*, and there is no configured
-egress to point at. ``ProxyStore`` harvests sixteen published lists across nine
+egress to point at. ``ProxyStore`` harvests fifty-five published lists across twenty-seven
 publishers, verifies addresses **against the real target**, remembers what
 worked, and ages out what did not, so the file never becomes a junk drawer.
 ``ProxyPool`` rotates over what survived, giving every address its own

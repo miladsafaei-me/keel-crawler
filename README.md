@@ -9,7 +9,7 @@ today, plus parallel/paced fetching and automatic URL discovery.
 | Layer | Concern | Status |
 |---|---|---|
 | **0 — Fetch** | Cheap-first `HttpFetcher`: `requests` + per-host throttle + DB response cache + dual-UA HTML. | ✅ |
-| **1 — Resilience / anti-bot** | `BrowserFetcher` (crawl4ai) with the retry ladder (transient → egress swap → proxy rotation), Cloudflare/DataDome/429 classifiers, Mihomo proxy client + scoring (disable + reset), the **self-maintaining public-proxy pool** (`proxy.pool`: 16 published lists, target-verified, per-address budgets, self-pruning store — stdlib only, no extra needed), egress-IP probe, pluggable captcha-solver hook, `link_harvest` DOM link discovery. Browser pieces behind the `browser` extra. | ✅ |
+| **1 — Resilience / anti-bot** | `BrowserFetcher` (crawl4ai) with the retry ladder (transient → egress swap → proxy rotation), Cloudflare/DataDome/429 classifiers, Mihomo proxy client + scoring (disable + reset), the **self-maintaining public-proxy pool** (`proxy.pool`: 55 published lists, target-verified, per-address budgets, refills itself as addresses die, self-pruning store — stdlib only, no extra needed), egress-IP probe, pluggable captcha-solver hook, `link_harvest` DOM link discovery. Browser pieces behind the `browser` extra. | ✅ |
 | **2 — Normalization** | HTML/Markdown → LLM-ready text (`clean/markdown.py`) + `SnapshotStore` (`{domain}.md`, traversal-safe, prompt-wrap separated from storage). | ✅ |
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
@@ -122,7 +122,7 @@ optional: **with `NO_PROXY=*` in the environment, both urllib and curl silently
 ignore an explicit proxy and connect directly**, so a rotating pool appears to
 work while every request leaves from the one address it exists to avoid.
 
-**Every address carries its country.** Only one of the sixteen lists labels
+**Every address carries its country.** Only a handful of the lists label
 geography, so the rest are resolved through ip-api.com (100 per call, no key) and
 persisted in the store - an address does not move, so the lookup is paid once
 ever. It matters because the endpoints these proxies are pointed at often answer
