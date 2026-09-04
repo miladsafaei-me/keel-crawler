@@ -14,6 +14,7 @@ from pathlib import Path
 
 from keel_crawler.proxy import jsonstore
 from keel_crawler.proxy.pool import (BLOCK_MEMORY_SECONDS, DEAD, DEAD_MEMORY_SECONDS,
+                                     VERIFY_WORKERS_MAX, ensure_file_limit,
                                      FAILURE_LIMIT, LIVE, STALE_LIVE_SECONDS,
                                      UNVERIFIED, UNVERIFIED_TTL_SECONDS, Budget,
                                      Proxy, ProxyPool, ProxyStore)
@@ -636,3 +637,29 @@ class RefillTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileLimitTests(unittest.TestCase):
+    """Concurrency here is spent in descriptors, not only in threads.
+
+    Every check and every fetch is a curl subprocess holding two pipes, and the
+    pool now verifies while the caller crawls. One harvest died of OSError 24 at
+    the line writing its response cache, which is how this failure presents: not
+    where the descriptors were spent, but wherever the next open happened to be.
+    """
+
+    def test_the_soft_limit_is_raised_toward_the_hard_one(self):
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(256, hard), hard))
+        raised = ensure_file_limit(1024)
+        self.assertGreaterEqual(raised, min(1024, hard))
+
+    def test_raising_it_never_raises(self):
+        """A refused rlimit gives a smaller pool, not a dead crawl."""
+        self.assertIsInstance(ensure_file_limit(-1), int)
+
+    def test_the_checker_never_takes_the_whole_worker_budget(self):
+        self.assertLessEqual(VERIFY_WORKERS_MAX, 120)

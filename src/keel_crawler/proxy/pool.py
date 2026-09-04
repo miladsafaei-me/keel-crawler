@@ -103,6 +103,9 @@ MAX_RECORDS = 20_000
 # throughput: throughput is confounded by the caller's own response cache, which
 # replays a whole level of work with zero network calls and would read as a
 # healthy pool at the exact moment the pool was emptying.
+# The checker never takes more than this many threads, however many the
+# caller asked for, because it is now running while the crawl is.
+VERIFY_WORKERS_MAX = 120
 REFILL_CHECK_SECONDS = 15.0
 # Refill when the pool falls to this share of its own high-water mark. Relative,
 # because `want` is often 0 ("keep everything that answers") and a fixed floor
@@ -122,6 +125,39 @@ PER_PROXY_PER_HOUR = 1500
 LIVE = "live"
 UNVERIFIED = "unverified"
 DEAD = "dead"
+
+
+# Every check and every fetch through the pool is a curl subprocess holding two
+# pipes, so concurrency here is spent in file descriptors as much as in threads:
+# 500 workers is already past a 1024 descriptor limit, and the pool now verifies
+# while the caller crawls, which stacks the two. The failure is not graceful — it
+# surfaces as OSError 24 from whatever unrelated line happens to open a file
+# next, which cost one harvest its output at the point it was writing its cache.
+# The soft limit is ours to raise (the hard limit on a Linux host is typically
+# hundreds of thousands), so raise it rather than rationing workers.
+FILE_LIMIT_TARGET = 65536
+
+
+def ensure_file_limit(target: int = FILE_LIMIT_TARGET) -> int:
+    """Raise this process's open-file soft limit toward ``target``.
+
+    Best effort and never raises: the module is POSIX-only, the call can be
+    refused, and a pool that cannot raise the limit is still a working pool —
+    just a smaller one than the caller asked for. Returns the limit in force.
+    """
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - Windows has no rlimits
+        return 0
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = min(target, hard) if hard > 0 else target
+        if wanted > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+            return wanted
+        return soft
+    except Exception:  # noqa: BLE001 - a refused rlimit must not end a crawl
+        return 0
 
 
 def _now() -> float:
@@ -547,8 +583,9 @@ class ProxyPool:
         the candidates one run may check in total (0 derives one from
         ``candidates``); ``refill=False`` restores the old single-pass behaviour.
         """
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor  # noqa: F401 - used by _verify
 
+        ensure_file_limit()
         store = store or ProxyStore()
         if not target:
             target = probe_url.split("/")[2] if "//" in probe_url else probe_url
@@ -638,13 +675,17 @@ class ProxyPool:
         cfg = self._verify_cfg
         results: dict = {}
         before = len(self)
+        # Deliberately not the caller's own worker count. Verification runs
+        # alongside the crawl for as long as the pool keeps refilling, and both
+        # sides spend descriptors, so the checker takes the smaller share.
+        checkers = min(cfg["workers"], VERIFY_WORKERS_MAX)
 
         def check(proxy):
             status, body = fetch_through(proxy, cfg["probe_url"], cfg["timeout"])
             return proxy, status, body
 
         try:
-            with ThreadPoolExecutor(max_workers=cfg["workers"]) as executor:
+            with ThreadPoolExecutor(max_workers=checkers) as executor:
                 for proxy, status, body in executor.map(check, batch):
                     ok = cfg["accept"](status, body)
                     results[proxy.addr] = ok
