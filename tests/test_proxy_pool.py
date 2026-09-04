@@ -62,6 +62,13 @@ class SourceParsingTests(unittest.TestCase):
         self.assertEqual(parse(html),
                          [("1.2.3.4:8080", "US", "http"), ("5.6.7.8:3128", "DE", "http")])
 
+    def test_a_page_that_prints_the_pair_in_one_cell_is_still_read(self):
+        """Table-shaped first, then a plain scan — a page with addresses on it
+        that yields nothing is a worse failure than a few junk matches, which
+        the address pattern rejects anyway."""
+        html = "<!DOCTYPE html><html><body><div>1.2.3.4:8080</div></body></html>"
+        self.assertEqual(parse(html), [("1.2.3.4:8080", "", "http")])
+
     def test_junk_and_hostnames_are_ignored(self):
         self.assertEqual(parse("# comment\n\nnot-an-ip:80\nexample.com:8080\n1.2.3.4:80"),
                          [("1.2.3.4:80", "", "http")])

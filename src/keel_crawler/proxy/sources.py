@@ -207,6 +207,7 @@ _TABLE_ROW = re.compile(
     r"<td[^>]*>\s*(\d{1,3}(?:\.\d{1,3}){3})\s*</td>\s*<td[^>]*>\s*(\d{2,5})\s*</td>"
     r"(?:\s*<td[^>]*>\s*([A-Za-z]{2})\s*</td>)?",
     re.I)
+_BARE_PAIR = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
 
 
 class Row(NamedTuple):
@@ -238,19 +239,35 @@ def _rows_from_json(text: str, default_kind: str) -> list[Row]:
     return found
 
 
-def _rows_from_html(text: str, default_kind: str) -> list[Row]:
-    """Read the ``<td>ip</td><td>port</td>`` tables several sites publish.
+def _looks_like_markup(text: str) -> bool:
+    """Whether this is a page rather than a list.
 
-    A regex rather than a parser, and a browser least of all: these tables are
-    server-rendered and two cells wide at the point that matters, so the cheap
-    read is also the complete one. A site that changes shape yields nothing,
-    which is the same outcome as a site that goes down and is handled the same
-    way — skipped, with the rest of the refresh unaffected.
+    Checked on the opening bytes, and deliberately loose: a published list never
+    starts with a tag, so a false positive costs nothing, while missing one
+    sends a whole page through a line parser that will find nothing in it.
     """
-    found = []
-    for ip, port, code in _TABLE_ROW.findall(text):
-        found.append(Row(f"{ip}:{port}", (code or "").upper(), default_kind))
-    return found
+    head = text[:500].lstrip().lower()
+    return head.startswith("<") or "<table" in head or "<td" in head
+
+
+def _rows_from_html(text: str, default_kind: str) -> list[Row]:
+    """Read the addresses out of a server-rendered page.
+
+    A regex rather than a parser, and a browser least of all: the tables that
+    matter are two cells wide at the point that matters, so the cheap read is
+    also the complete one. Where the two-cell shape is absent the page is
+    scanned for bare ``ip:port`` instead — several sites print the pair in one
+    cell, and finding nothing on a page that plainly contains addresses is a
+    worse failure than a few junk matches, which the address pattern rejects
+    anyway. A site that changes past both is skipped, exactly like a site that
+    goes down, with the rest of the refresh unaffected.
+    """
+    found = [Row(f"{ip}:{port}", (code or "").upper(), default_kind)
+             for ip, port, code in _TABLE_ROW.findall(text)]
+    if found:
+        return found
+    return [Row(f"{ip}:{port}", "", default_kind)
+            for ip, port in _BARE_PAIR.findall(text)]
 
 
 def parse(text: str, default_kind: str = "http") -> list[Row]:
@@ -263,7 +280,7 @@ def parse(text: str, default_kind: str = "http") -> list[Row]:
     text = text.strip()
     if text.startswith("{") or text.startswith("["):
         return _rows_from_json(text, default_kind)
-    if "<td" in text[:200000].lower():
+    if _looks_like_markup(text):
         return _rows_from_html(text, default_kind)
 
     found = []
