@@ -3,7 +3,7 @@
 Reusable, **business-blind** web-crawling toolkit for Keel consumer projects —
 extracted from the Revenika / Propopedia / Binarystyle crawlers.
 
-The package is layered so a consumer pulls only what it needs — all five layers ship
+The package is layered so a consumer pulls only what it needs — all six layers ship
 today, plus parallel/paced fetching and automatic URL discovery.
 
 | Layer | Concern | Status |
@@ -13,6 +13,7 @@ today, plus parallel/paced fetching and automatic URL discovery.
 | **2 — Normalization** | HTML/Markdown → LLM-ready text (`clean/markdown.py`) + `SnapshotStore` (`{domain}.md`, traversal-safe, prompt-wrap separated from storage). | ✅ |
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
+| **5 — Platform research (YouTube)** | Quota-accounted Data API client, autocomplete snapshots and per-channel outlier maths (`youtube/`). Pure `requests`, no Django. | ✅ |
 
 Cross-cutting: **parallel + paced fetching** (`BrowserFetcher.fetch_many` runs URLs
 concurrently under a `concurrency` cap and an evenly-spaced `rate_per_minute` limiter,
@@ -61,6 +62,48 @@ html = fetcher.get_html_document("https://example.com/")
 # LLM-ready pruning; pass your own domain vocabulary to rescue short data lines:
 md = optimize_markdown_for_llm(raw_markdown, vital_keywords={"cpa", "pips", "mt4"})
 ```
+
+## Use (Layer 5 — YouTube research)
+
+Reading YouTube for research is rationed, not blocked: the Data API grants 10,000
+units a day and prices its endpoints 100x apart, so the whole layer is built around
+spending the cheap ones.
+
+```python
+from keel_crawler.youtube import QuotaLedger, YouTubeDataApi, channel_baseline, outlier_multiplier
+
+api = YouTubeDataApi(api_key, ledger=QuotaLedger(limit=2_000))
+
+channel = api.channels(handles=["@somechannel"])[0]          # 1 unit
+uploads = api.uploads_playlist_id(channel)
+rows = api.playlist_items(uploads, max_pages=1)              # 1 unit, 50 videos
+ids = [row["contentDetails"]["videoId"] for row in rows]
+videos = api.videos(ids)                                     # 1 unit per 50 ids
+
+views = [int(v["statistics"].get("viewCount", 0)) for v in videos]
+baseline = channel_baseline(views)
+print(api.ledger.summary())                                  # "3/2000 units (...)"
+```
+
+Three things this layer refuses to do, each because the convenient version is the
+expensive one:
+
+- **`search.list` needs `allow_search=True`.** It costs 100 units — a hundred uploads
+  pages — and it is the endpoint every first draft reaches for.
+- **A channel's uploads come from its uploads playlist**, never from a channel-filtered
+  search, which returns the same rows for a hundred times the price.
+- **The ledger is charged before the request leaves**, so a batch stops on its own
+  budget instead of on a `quotaExceeded` that reads like a broken key in the morning.
+
+`youtube.suggest` reads YouTube's autocomplete, which is the only free reading of
+YouTube demand that comes from YouTube itself. It rations by IP rather than by key,
+so it is the one part of this layer that wants `proxy_url`. A single snapshot says
+little; `diff_snapshots` between two of them is the signal.
+
+`youtube.velocity` answers two different questions and keeps them apart:
+`outlier_multiplier` compares lifetime views with the channel's own median (settled,
+slow) and `read_velocity` compares views per hour with the channel's own early pace
+(unsettled, fast). Only the second can see a trend while it is still forming.
 
 ## Use (Layer 1 — browser + anti-bot)
 
