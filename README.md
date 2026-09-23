@@ -65,6 +65,10 @@ md = optimize_markdown_for_llm(raw_markdown, vital_keywords={"cpa", "pips", "mt4
 
 ## Use (Layer 5 — YouTube research)
 
+> Pin **v0.16.1** or newer. `v0.16.0` was cut against the commit before this layer
+> landed — the tag was made in a checkout that had not yet synced — so an install of
+> it resolves without `keel_crawler.youtube` and fails at import in the consumer.
+
 Reading YouTube for research is rationed, not blocked: the Data API grants 10,000
 units a day and prices its endpoints 100x apart, so the whole layer is built around
 spending the cheap ones.
