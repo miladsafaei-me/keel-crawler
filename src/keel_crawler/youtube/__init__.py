@@ -13,6 +13,18 @@ from keel_crawler.youtube.api import (
     YouTubeApiError,
     YouTubeDataApi,
 )
+from keel_crawler.youtube.patterns import (
+    FIRM_TOKEN,
+    FeatureLift,
+    MONEY_TOKEN,
+    NUMBER_TOKEN,
+    Template,
+    TitleRow,
+    YEAR_TOKEN,
+    feature_lift,
+    mask_title,
+    mine_templates,
+)
 from keel_crawler.youtube.quota import (
     DEFAULT_DAILY_LIMIT,
     QUOTA_COSTS,
@@ -25,15 +37,19 @@ from keel_crawler.youtube.suggest import (
     fetch_suggestions,
 )
 from keel_crawler.youtube.velocity import (
+    PaceReading,
     VelocityReading,
     channel_baseline,
     early_pace_baseline,
+    gain_in_window,
     looks_like_short,
     outlier_multiplier,
+    pace_multiple,
     parse_duration_seconds,
     parse_published_at,
     read_velocity,
     views_per_hour,
+    window_pace,
 )
 
 __all__ = [
@@ -46,15 +62,29 @@ __all__ = [
     "QuotaExhausted",
     "QuotaLedger",
     "SuggestUnavailable",
+    "FIRM_TOKEN",
+    "MONEY_TOKEN",
+    "NUMBER_TOKEN",
+    "YEAR_TOKEN",
+    "FeatureLift",
+    "Template",
+    "TitleRow",
+    "feature_lift",
+    "mask_title",
+    "mine_templates",
     "diff_snapshots",
     "fetch_suggestions",
+    "PaceReading",
     "VelocityReading",
     "channel_baseline",
     "early_pace_baseline",
+    "gain_in_window",
     "looks_like_short",
     "outlier_multiplier",
+    "pace_multiple",
     "parse_duration_seconds",
     "parse_published_at",
     "read_velocity",
     "views_per_hour",
+    "window_pace",
 ]

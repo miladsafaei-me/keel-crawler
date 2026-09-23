@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Iterable
 
 ISO_DURATION = re.compile(
     r"^P(?:(?P<days>\d+)D)?T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?$"
@@ -159,3 +160,129 @@ def parse_published_at(value: str) -> datetime:
 
 def window_start(days: int, *, now: datetime | None = None) -> datetime:
     return (now or datetime.now(timezone.utc)) - timedelta(days=days)
+
+
+@dataclass(frozen=True)
+class PaceReading:
+    """Views gained per hour between two observations of the same video.
+
+    This is the reading :func:`read_velocity` cannot give. That one divides lifetime
+    views by lifetime hours, so it describes a video's whole life and necessarily
+    decays as the video ages: a two-year-old video that YouTube starts recommending
+    again cannot move it, because the numerator gains a few thousand views against a
+    denominator of seventeen thousand hours. A pace measured between two observations
+    answers what is happening *now*, and the same re-recommendation shows up as a
+    tenfold reading.
+
+    ``gained`` is kept as measured, negative values included. A view count that falls
+    is YouTube removing views it had already served, which is a real event and not a
+    reason to publish a zero.
+    """
+
+    views_per_hour: float
+    span_hours: float
+    gained: int
+    from_views: int
+    to_views: int
+    observations: int
+
+
+def _sorted_observations(
+    observations: Iterable[tuple[datetime, int]],
+) -> list[tuple[datetime, int]]:
+    rows = [
+        (moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc), int(views))
+        for moment, views in observations
+    ]
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
+def window_pace(
+    observations: Iterable[tuple[datetime, int]],
+    *,
+    min_span_hours: float = 3.0,
+    max_span_hours: float = 48.0,
+) -> PaceReading | None:
+    """The most recent pace that can be measured over a long enough span.
+
+    Two observations twenty minutes apart on a video gaining a hundred views a day
+    measure either zero or one view, and multiplying that by 72 to reach a daily rate
+    turns rounding into a trend. ``min_span_hours`` is the floor under that, and the
+    pair chosen is the *newest* one that clears it, so the answer describes the latest
+    interval rather than an average of the window.
+
+    ``None`` means the question cannot be answered yet, which is a different statement
+    from a pace of zero and is reported differently by every caller here.
+    """
+    rows = _sorted_observations(observations)
+    if len(rows) < 2:
+        return None
+    end_at, end_views = rows[-1]
+    start: tuple[datetime, int] | None = None
+    for moment, views in reversed(rows[:-1]):
+        span = (end_at - moment).total_seconds() / 3600.0
+        if span > max_span_hours:
+            break
+        if span >= min_span_hours:
+            start = (moment, views)
+            break
+    if start is None:
+        return None
+    span_hours = (end_at - start[0]).total_seconds() / 3600.0
+    gained = end_views - start[1]
+    return PaceReading(
+        views_per_hour=round(gained / span_hours, 2),
+        span_hours=round(span_hours, 2),
+        gained=gained,
+        from_views=start[1],
+        to_views=end_views,
+        observations=len(rows),
+    )
+
+
+def gain_in_window(
+    observations: Iterable[tuple[datetime, int]],
+    *,
+    since: datetime,
+) -> PaceReading | None:
+    """What a video gained inside a window, counting only what was actually watched.
+
+    The start is the newest observation at or before ``since``. Where there is none --
+    a video first read after the window opened -- the earliest observation inside the
+    window is used instead, and the span shortens with it. The alternative is to treat
+    a first reading as a gain, which would report a video's entire lifetime views as
+    having arrived today and put every newly tracked video at the top of the board.
+    """
+    rows = _sorted_observations(observations)
+    if len(rows) < 2:
+        return None
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    before = [row for row in rows if row[0] <= since]
+    start = before[-1] if before else rows[0]
+    end_at, end_views = rows[-1]
+    if end_at <= start[0]:
+        return None
+    span_hours = (end_at - start[0]).total_seconds() / 3600.0
+    gained = end_views - start[1]
+    return PaceReading(
+        views_per_hour=round(gained / span_hours, 2) if span_hours else 0.0,
+        span_hours=round(span_hours, 2),
+        gained=gained,
+        from_views=start[1],
+        to_views=end_views,
+        observations=len(rows),
+    )
+
+
+def pace_multiple(pace: float, reference: float) -> float:
+    """How many times a reference pace this one is, or zero where there is no reference.
+
+    The same refusal as :func:`outlier_multiplier`: without a denominator there is no
+    multiple, and inventing one would rank every video on a channel we have watched
+    for a day as a discovery.
+    """
+    if reference <= 0:
+        return 0.0
+    return round(pace / reference, 2)

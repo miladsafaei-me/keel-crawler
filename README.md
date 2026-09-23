@@ -13,7 +13,7 @@ today, plus parallel/paced fetching and automatic URL discovery.
 | **2 — Normalization** | HTML/Markdown → LLM-ready text (`clean/markdown.py`) + `SnapshotStore` (`{domain}.md`, traversal-safe, prompt-wrap separated from storage). | ✅ |
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
-| **5 — Platform research (YouTube)** | Quota-accounted Data API client, autocomplete snapshots and per-channel outlier maths (`youtube/`). Pure `requests`, no Django. | ✅ |
+| **5 — Platform research (YouTube)** | Quota-accounted Data API client, autocomplete snapshots, per-channel outlier and pace maths, and a title-form miner (`youtube/`). Pure `requests`, no Django. | ✅ |
 
 Cross-cutting: **parallel + paced fetching** (`BrowserFetcher.fetch_many` runs URLs
 concurrently under a `concurrency` cap and an evenly-spaced `rate_per_minute` limiter,
@@ -104,10 +104,24 @@ YouTube demand that comes from YouTube itself. It rations by IP rather than by k
 so it is the one part of this layer that wants `proxy_url`. A single snapshot says
 little; `diff_snapshots` between two of them is the signal.
 
-`youtube.velocity` answers two different questions and keeps them apart:
+`youtube.velocity` answers three different questions and keeps them apart:
 `outlier_multiplier` compares lifetime views with the channel's own median (settled,
-slow) and `read_velocity` compares views per hour with the channel's own early pace
-(unsettled, fast). Only the second can see a trend while it is still forming.
+slow), `read_velocity` compares views per hour since publication with the channel's own
+early pace (unsettled, fast), and `window_pace` measures views gained per hour **between
+two observations** of the same video. The third is the only one that can see an old video
+being recommended again: a lifetime rate cannot move once the denominator is seventeen
+thousand hours, while a pace taken over the last six reads tenfold. `gain_in_window`
+answers "what did it gain today" and counts only what was gained while we were watching,
+so a video first read an hour ago does not report its whole view count as today's gain.
+
+`youtube.patterns` reads the **form** a title is packaged in, with no vocabulary at all.
+`mask_title` replaces brands, years, money and counts with placeholders, so `FTMO Payout
+Proof 2026: $8,400 in 9 Days` and `Apex Payout Proof 2025 - $2,100 in 4 days` become one
+form; `mine_templates` then ranks the recurring openings by how many videos carry them and
+what those videos did, which is how a competitor's fixed series becomes visible as a
+series. `feature_lift` measures one packaging feature at a time -- a question mark, a
+percentage, a bracketed suffix -- against the titles that lack it. Every reading is a
+regular expression and a median, so the whole module runs on a timer under a no-model rule.
 
 ## Use (Layer 1 — browser + anti-bot)
 
