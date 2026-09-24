@@ -13,7 +13,7 @@ today, plus parallel/paced fetching and automatic URL discovery.
 | **2 — Normalization** | HTML/Markdown → LLM-ready text (`clean/markdown.py`) + `SnapshotStore` (`{domain}.md`, traversal-safe, prompt-wrap separated from storage). | ✅ |
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
-| **5 — Platform research (YouTube)** | Quota-accounted Data API client, autocomplete snapshots, per-channel outlier and pace maths, and a title-form miner (`youtube/`). Pure `requests`, no Django. | ✅ |
+| **5 — Platform research (YouTube)** | Quota-accounted Data API client, autocomplete snapshots, per-channel outlier and pace maths, a title-form miner, and an OAuth-gated Analytics + Reporting layer for a channel's own numbers (`youtube/`). Pure `requests`, no Django. | ✅ |
 
 Cross-cutting: **parallel + paced fetching** (`BrowserFetcher.fetch_many` runs URLs
 concurrently under a `concurrency` cap and an evenly-spaced `rate_per_minute` limiter,
@@ -122,6 +122,75 @@ what those videos did, which is how a competitor's fixed series becomes visible 
 series. `feature_lift` measures one packaging feature at a time -- a question mark, a
 percentage, a bracketed suffix -- against the titles that lack it. Every reading is a
 regular expression and a median, so the whole module runs on a timer under a no-model rule.
+
+### A channel's own numbers: OAuth, Analytics and Reporting
+
+> Pin **v0.20.0** or newer for `oauth.py`, `analytics.py`, `reporting.py` and
+> `consent.py`.
+
+Everything above reads what anyone can see. Watch time, retention, subscriber deltas
+and thumbnail-impression CTR are visible only to the channel owner, and Google gates
+them behind OAuth rather than an API key -- a different credential, and a different
+consent flow, from the Data API client above.
+
+**One-time setup, run by whoever owns the channel, from a machine with a browser:**
+
+```bash
+python3 src/keel_crawler/youtube/consent.py \
+    --client-id YOUR_CLIENT_ID.apps.googleusercontent.com \
+    --client-secret YOUR_CLIENT_SECRET \
+    --write-env .env
+```
+
+It walks the installed-app OAuth flow (a loopback redirect on `http://127.0.0.1:8765/`,
+not a registered web redirect), for the scopes `yt-analytics.readonly` and
+`youtube.readonly`, confirms which channel was authorized, and prints (or, with
+`--write-env`, writes) four `.env` lines: `YOUTUBE_OAUTH_CLIENT_ID`,
+`YOUTUBE_OAUTH_CLIENT_SECRET`, `YOUTUBE_OAUTH_REFRESH_TOKEN`, `YOUTUBE_CHANNEL_ID`.
+
+**The 7-day trap:** a Google Cloud OAuth consent screen left in "Testing" issues
+refresh tokens that silently stop working after 7 days -- no warning at consent time,
+just an `invalid_grant` the next time a host tries to refresh. Before running
+`consent.py`, set the consent screen to **"In production"** (Google Cloud Console >
+APIs & Services > OAuth consent screen); a token minted while still in "Testing" needs
+a fresh consent run after the switch, the expiry is not lifted retroactively.
+`OAuthError` names this trap explicitly whenever a refresh fails with `invalid_grant`.
+
+**Reading the numbers, once consent has produced a refresh token:**
+
+```python
+from datetime import date
+from keel_crawler.youtube import (
+    OAuthCredentials, YouTubeAnalyticsApi, YouTubeReportingApi, REACH_BASIC_REPORT,
+)
+
+creds = OAuthCredentials(client_id, client_secret, refresh_token)
+analytics = YouTubeAnalyticsApi(creds)
+
+daily = analytics.video_daily("dQw4w9WgXcQ", date(2026, 9, 1), date(2026, 9, 23))
+curve = analytics.retention_curve("dQw4w9WgXcQ", date(2026, 9, 1), date(2026, 9, 23))
+sources = analytics.traffic_sources("dQw4w9WgXcQ", date(2026, 9, 1), date(2026, 9, 23))
+
+reporting = YouTubeReportingApi(creds)
+job_id = reporting.ensure_job(REACH_BASIC_REPORT, "channel reach")
+for report in reporting.list_reports(job_id):
+    rows = reporting.download_rows(report)  # thumbnail impressions + CTR, per day/video
+```
+
+`YouTubeAnalyticsApi.query` is the general form -- `video_daily`, `retention_curve` and
+`traffic_sources` are named helpers over it, each pinned to the dimension and filter
+shape that report actually needs (`retention_curve` in particular refuses a filter
+naming more than one video; the report itself does). All three zip the response's own
+`columnHeaders` onto each row, so a caller reads `row["views"]` rather than a
+position in an array.
+
+`YouTubeReportingApi` is the other half, for numbers the Analytics API has no query
+dimension for (thumbnail impressions and CTR among them): a standing **job**
+(`ensure_job`, idempotent -- it reuses an existing job rather than creating a second
+one) that Google fills with one CSV report per day, starting roughly two days after
+the job is created. `list_reports` follows pagination and returns each report's
+metadata (including its `downloadUrl`); `download_rows` fetches and parses one into
+plain dicts, transparently handling both a gzip-compressed body and a plain one.
 
 ## Use (Layer 1 — browser + anti-bot)
 

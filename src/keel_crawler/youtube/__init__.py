@@ -7,12 +7,20 @@ the host.
 Nothing here imports Django, so the layer runs in a script, a management command or a
 test with no settings configured.
 """
+from keel_crawler.youtube.analytics import (
+    RETENTION_METRICS,
+    TRAFFIC_SOURCE_METRICS,
+    VIDEO_DAILY_METRICS,
+    YouTubeAnalyticsApi,
+    YouTubeAnalyticsError,
+)
 from keel_crawler.youtube.api import (
     MAX_IDS_PER_CALL,
     SearchNotAllowed,
     YouTubeApiError,
     YouTubeDataApi,
 )
+from keel_crawler.youtube.oauth import OAuthCredentials, OAuthError
 from keel_crawler.youtube.patterns import (
     DEFAULT_STOPWORDS,
     FIRM_TOKEN,
@@ -34,6 +42,11 @@ from keel_crawler.youtube.quota import (
     QUOTA_COSTS,
     QuotaExhausted,
     QuotaLedger,
+)
+from keel_crawler.youtube.reporting import (
+    REACH_BASIC_REPORT,
+    YouTubeReportingApi,
+    YouTubeReportingError,
 )
 from keel_crawler.youtube.suggest import (
     SuggestUnavailable,
@@ -61,6 +74,16 @@ __all__ = [
     "SearchNotAllowed",
     "YouTubeApiError",
     "YouTubeDataApi",
+    "OAuthCredentials",
+    "OAuthError",
+    "YouTubeAnalyticsApi",
+    "YouTubeAnalyticsError",
+    "VIDEO_DAILY_METRICS",
+    "RETENTION_METRICS",
+    "TRAFFIC_SOURCE_METRICS",
+    "YouTubeReportingApi",
+    "YouTubeReportingError",
+    "REACH_BASIC_REPORT",
     "DEFAULT_DAILY_LIMIT",
     "QUOTA_COSTS",
     "QuotaExhausted",
