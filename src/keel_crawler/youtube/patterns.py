@@ -334,6 +334,7 @@ def mine_angles(
     min_subjects: int = 3,
     lengths: Sequence[int] = (1, 2, 3),
     limit: int = 40,
+    absorb_share: float | None = None,
 ) -> list[Angle]:
     """Recurring phrases **anywhere** in a masked title, kept only where they repeat
     across publishers and across subjects.
@@ -359,6 +360,13 @@ def mine_angles(
     but no further than that. ``rules`` and ``rules explained`` have different supports
     and are different claims: the first is a subject, the second is a format, and
     collapsing them loses the one a host can actually reproduce.
+
+    **``absorb_share`` goes one step further, and only when asked.** A shorter phrase is
+    also dropped when at least that share of *its own* videos carry a longer kept phrase
+    containing it. Measured on a 603-title corpus: ``hidden`` had fourteen videos and
+    eleven of them said ``hidden rules`` -- one phrase whose three leftover videos were
+    reported as a second format. Off by default, because the exact-support rule above is
+    the only one that can never merge two different claims.
     """
     if not rows:
         return []
@@ -400,6 +408,19 @@ def mine_angles(
         and _contains_phrase(longer, shorter)
         and len(kept[longer]) == len(kept[shorter])
     }
+
+    if absorb_share is not None:
+        for shorter, short_members in kept.items():
+            if shorter in redundant:
+                continue
+            own = {id(member) for member in short_members}
+            for longer, long_members in kept.items():
+                if longer == shorter or longer in redundant or not _contains_phrase(longer, shorter):
+                    continue
+                shared = own & {id(member) for member in long_members}
+                if len(shared) >= absorb_share * len(own):
+                    redundant.add(shorter)
+                    break
 
     angles: list[Angle] = []
     for phrase, members in kept.items():

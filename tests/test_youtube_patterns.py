@@ -319,6 +319,36 @@ class MineAnglesTests(unittest.TestCase):
     def test_an_empty_corpus_returns_nothing_rather_than_raising(self):
         self.assertEqual(mine_angles([]), [])
 
+    def test_a_phrase_mostly_inside_a_longer_one_is_absorbed_only_when_asked(self):
+        """``hidden`` with three of its four videos saying ``hidden rules``."""
+        rows = [
+            AngleRow(form=f"{{FIRM}} hidden rules {word}", metric=1.0, group=g, subjects=(s,))
+            for word, g, s in (("alpha", "a", "f1"), ("beta", "b", "f2"), ("gamma", "c", "f3"))
+        ] + [AngleRow(form="{FIRM} hidden truth", metric=1.0, group="d", subjects=("f4",))]
+        plain = [a.text for a in mine_angles(rows, min_videos=3, min_groups=3, min_subjects=3)]
+        self.assertIn("hidden", plain)
+        absorbed = [a.text for a in mine_angles(
+            rows, min_videos=3, min_groups=3, min_subjects=3, absorb_share=0.75
+        )]
+        self.assertNotIn("hidden", absorbed)
+        self.assertIn("hidden rules", absorbed)
+
+    def test_a_phrase_with_its_own_life_is_never_absorbed(self):
+        """``rules`` is a subject in its own right; ``rules explained`` holds a third of it."""
+        rows = [
+            AngleRow(form=f"{{FIRM}} rules explained {w}", metric=1.0, group=g, subjects=(s,))
+            for w, g, s in (("one", "a", "f1"), ("two", "b", "f2"), ("six", "c", "f3"))
+        ] + [
+            AngleRow(form=f"{{FIRM}} rules {w}", metric=1.0, group=g, subjects=(s,))
+            for w, g, s in (("alpha", "a", "f1"), ("beta", "b", "f2"), ("gamma", "c", "f3"),
+                            ("delta", "a", "f4"), ("omega", "b", "f5"), ("sigma", "c", "f6"))
+        ]
+        texts = [a.text for a in mine_angles(
+            rows, min_videos=3, min_groups=3, min_subjects=3, absorb_share=0.75
+        )]
+        self.assertIn("rules", texts)
+        self.assertIn("rules explained", texts)
+
     def test_a_thin_angle_says_so_on_the_row(self):
         self.assertTrue(self.mined()["rules explained"].is_thin)
 
