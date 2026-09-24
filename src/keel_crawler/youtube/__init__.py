@@ -14,7 +14,10 @@ from keel_crawler.youtube.api import (
     YouTubeDataApi,
 )
 from keel_crawler.youtube.patterns import (
+    DEFAULT_STOPWORDS,
     FIRM_TOKEN,
+    Angle,
+    AngleRow,
     FeatureLift,
     MONEY_TOKEN,
     NUMBER_TOKEN,
@@ -23,6 +26,7 @@ from keel_crawler.youtube.patterns import (
     YEAR_TOKEN,
     feature_lift,
     mask_title,
+    mine_angles,
     mine_templates,
 )
 from keel_crawler.youtube.quota import (
@@ -66,11 +70,15 @@ __all__ = [
     "MONEY_TOKEN",
     "NUMBER_TOKEN",
     "YEAR_TOKEN",
+    "DEFAULT_STOPWORDS",
+    "Angle",
+    "AngleRow",
     "FeatureLift",
     "Template",
     "TitleRow",
     "feature_lift",
     "mask_title",
+    "mine_angles",
     "mine_templates",
     "diff_snapshots",
     "fetch_suggestions",

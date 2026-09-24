@@ -270,3 +270,173 @@ def feature_lift(
         )
     out.sort(key=lambda f: -f.lift)
     return out
+
+
+"""Words that carry no angle, and are dropped before any n-gram is assembled.
+
+Deliberately short and English-only. A corpus in another language passes its own set
+through ``stopwords``; the host knows what it collects and this module does not.
+"""
+DEFAULT_STOPWORDS = frozenset(
+    """a an the of in on for to and or with my your our their this that these those
+    is are was were be been am i we you it its his her as at by from into over under
+    after before than then so but if not no yes do does did done get got make made
+    new all any more most very just about out up down off he she they them there here
+    what which who whom whose how why when where can could will would should may might
+    must shall let s t re ve ll d m""".split()
+)
+
+
+@dataclass(frozen=True)
+class AngleRow:
+    """One video as the angle miner needs it.
+
+    ``form`` is the masked skeleton, so the subject has already become a placeholder and
+    the words left are what the title *says about* it. ``group`` is whoever published it
+    and ``subjects`` is what the host's own vocabulary found in it -- both exist so the
+    miner can refuse a phrase that only one channel uses or that has only ever been said
+    about one subject, which is the difference between a format and a habit.
+    """
+
+    form: str
+    metric: float
+    group: str = ""
+    subjects: tuple[str, ...] = ()
+    title: str = ""
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class Angle:
+    """One thing titles repeatedly say about their subject, and how those videos did."""
+
+    text: str
+    videos: int
+    groups: int
+    subjects: tuple[str, ...]
+    median_metric: float
+    lift: float
+    examples: tuple[str, ...]
+
+    @property
+    def is_thin(self) -> bool:
+        """Whether the sample is small enough to read as a hint rather than a result."""
+        return self.videos < 20
+
+
+def mine_angles(
+    rows: Sequence[AngleRow],
+    *,
+    ignore: Iterable[str] = (),
+    stopwords: Iterable[str] | None = None,
+    min_videos: int = 8,
+    min_groups: int = 3,
+    min_subjects: int = 3,
+    lengths: Sequence[int] = (1, 2, 3),
+    limit: int = 40,
+) -> list[Angle]:
+    """Recurring phrases **anywhere** in a masked title, kept only where they repeat
+    across publishers and across subjects.
+
+    The sibling of :func:`mine_templates` and not a duplicate of it. That one mines the
+    **opening** of a title, which is where a series announces itself, and its output is
+    one channel's programme. This one mines any position, because the thing a host wants
+    to reproduce is not where the words sit but what they claim: ``All Rules Explained``
+    arrives at the front of one title, after a brand in the next and behind two pipes in
+    the third, and a prefix miner sees three different forms.
+
+    **Three floors, and each removes a different false positive.** ``min_videos`` removes
+    the coincidence. ``min_groups`` removes one channel's house style, which is the
+    failure a raw frequency count always produces -- a prolific publisher's habit
+    outranks the field's actual convention. ``min_subjects`` removes the phrase that is
+    really a proper noun: a brand the host's vocabulary does not hold still reads as an
+    ordinary phrase, and the one thing it can never do is appear against three different
+    subjects.
+
+    **A shorter phrase is dropped only when a longer one has exactly its support.** The
+    same rule :func:`mine_templates` uses, and for the same reason -- ``cheapest prop``
+    and ``cheapest prop firm`` at sixteen videos each are one phrase printed twice --
+    but no further than that. ``rules`` and ``rules explained`` have different supports
+    and are different claims: the first is a subject, the second is a format, and
+    collapsing them loses the one a host can actually reproduce.
+    """
+    if not rows:
+        return []
+    stop = frozenset(stopwords) if stopwords is not None else DEFAULT_STOPWORDS
+    skip = {phrase.strip().lower() for phrase in ignore if phrase and phrase.strip()}
+    corpus = median([row.metric for row in rows])
+
+    buckets: dict[str, list[AngleRow]] = {}
+    for row in rows:
+        tokens = [
+            token
+            for token in row.form.split()
+            if not token.startswith("{") and token not in stop
+        ]
+        seen: set[str] = set()
+        for length in lengths:
+            for start in range(len(tokens) - length + 1):
+                phrase = " ".join(tokens[start : start + length])
+                if phrase in seen or phrase in skip:
+                    continue
+                seen.add(phrase)
+                buckets.setdefault(phrase, []).append(row)
+
+    kept: dict[str, list[AngleRow]] = {}
+    for phrase, members in buckets.items():
+        if len(members) < min_videos:
+            continue
+        if len({member.group for member in members}) < min_groups:
+            continue
+        if len({subject for member in members for subject in member.subjects}) < min_subjects:
+            continue
+        kept[phrase] = members
+
+    redundant = {
+        shorter
+        for shorter in kept
+        for longer in kept
+        if longer != shorter
+        and _contains_phrase(longer, shorter)
+        and len(kept[longer]) == len(kept[shorter])
+    }
+
+    angles: list[Angle] = []
+    for phrase, members in kept.items():
+        if phrase in redundant:
+            continue
+        metric = median([member.metric for member in members])
+        angles.append(
+            Angle(
+                text=phrase,
+                videos=len(members),
+                groups=len({member.group for member in members}),
+                subjects=tuple(
+                    sorted({subject for member in members for subject in member.subjects})
+                ),
+                median_metric=metric,
+                lift=round(metric / corpus, 2) if corpus else 0.0,
+                examples=tuple(
+                    (member.label or member.title)
+                    for member in sorted(members, key=lambda r: -r.metric)[:3]
+                ),
+            )
+        )
+    angles.sort(key=lambda angle: (-angle.videos, -angle.median_metric))
+    return angles[:limit]
+
+
+def _contains_phrase(haystack: str, needle: str) -> bool:
+    """Whether ``needle`` appears in ``haystack`` as a whole run of words.
+
+    A plain ``in`` test would read ``rule`` inside ``rules explained`` and drop a phrase
+    that is not a sub-phrase at all, which is the same word-boundary trap the column
+    vocabularies hit with a substring test.
+    """
+    outer = haystack.split()
+    inner = needle.split()
+    if len(inner) >= len(outer):
+        return False
+    return any(
+        outer[i : i + len(inner)] == inner for i in range(len(outer) - len(inner) + 1)
+    )

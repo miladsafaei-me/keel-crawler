@@ -12,12 +12,14 @@ from datetime import datetime, timedelta, timezone
 
 from keel_crawler.youtube import (
     FIRM_TOKEN,
+    AngleRow,
     MONEY_TOKEN,
     NUMBER_TOKEN,
     TitleRow,
     YEAR_TOKEN,
     feature_lift,
     gain_in_window,
+    mine_angles,
     mask_title,
     mine_templates,
     pace_multiple,
@@ -230,6 +232,95 @@ class FeatureLiftTests(unittest.TestCase):
             rows, {"scam": r"scam", "best": r"best"}, min_matched=8
         )]
         self.assertEqual(names[0], "scam")
+
+
+class MineAnglesTests(unittest.TestCase):
+    """The angle miner, whose whole job is refusing three different false positives."""
+
+    def rows(self, **over):
+        """A corpus where one phrase is a real format and three others only look like one."""
+        base = [
+            # A real format: three channels, three subjects.
+            AngleRow(form="{FIRM} all rules explained", metric=2.0, group="a", subjects=("f1",)),
+            AngleRow(form="honest {FIRM} rules explained", metric=2.0, group="b", subjects=("f2",)),
+            AngleRow(form="{FIRM} rules explained in detail", metric=2.0, group="c", subjects=("f3",)),
+            # One channel's habit: same phrase, one publisher.
+            AngleRow(form="{FIRM} weekly recap", metric=9.0, group="a", subjects=("f1",)),
+            AngleRow(form="{FIRM} weekly recap", metric=9.0, group="a", subjects=("f2",)),
+            AngleRow(form="{FIRM} weekly recap", metric=9.0, group="a", subjects=("f3",)),
+            # A brand the vocabulary does not hold: three channels, one subject.
+            AngleRow(form="shark funded review", metric=9.0, group="a", subjects=("f1",)),
+            AngleRow(form="shark funded payout", metric=9.0, group="b", subjects=("f1",)),
+            AngleRow(form="shark funded drawdown", metric=9.0, group="c", subjects=("f1",)),
+        ]
+        return base
+
+    def mined(self, **over):
+        kwargs = {"min_videos": 3, "min_groups": 3, "min_subjects": 3}
+        kwargs.update(over)
+        return {angle.text: angle for angle in mine_angles(self.rows(), **kwargs)}
+
+    def test_a_phrase_repeated_across_channels_and_subjects_is_an_angle(self):
+        self.assertIn("rules explained", self.mined())
+
+    def test_one_channels_habit_never_becomes_a_format(self):
+        """Three videos, three subjects, one publisher: a house style, not a convention."""
+        self.assertNotIn("weekly recap", self.mined())
+
+    def test_a_brand_the_vocabulary_misses_is_refused_by_the_subject_floor(self):
+        """It can be said by every channel and still only ever be said about itself."""
+        self.assertNotIn("shark funded", self.mined())
+
+    def test_the_subject_floor_is_what_refuses_it_and_nothing_else(self):
+        self.assertIn("shark funded", self.mined(min_subjects=1))
+
+    def test_a_placeholder_is_never_part_of_an_angle(self):
+        self.assertFalse(any("{" in text for text in self.mined(min_subjects=1)))
+
+    def test_a_stopword_is_never_part_of_an_angle(self):
+        self.assertNotIn("all", self.mined(min_subjects=1))
+
+    def test_a_shorter_phrase_with_the_same_support_is_dropped_for_the_longer(self):
+        """``rules`` and ``explained`` each cover the same three videos as the pair."""
+        mined = self.mined()
+        self.assertIn("rules explained", mined)
+        self.assertNotIn("rules", mined)
+        self.assertNotIn("explained", mined)
+
+    def test_a_shorter_phrase_with_more_support_survives_the_longer_one(self):
+        """``rules`` is a subject and ``rules explained`` a format; both are true."""
+        rows = self.rows() + [
+            AngleRow(form="{FIRM} rules you must know", metric=1.0, group="d", subjects=("f4",))
+        ]
+        texts = [a.text for a in mine_angles(rows, min_videos=3, min_groups=3, min_subjects=3)]
+        self.assertIn("rules", texts)
+        self.assertIn("rules explained", texts)
+
+    def test_an_ignored_phrase_never_reaches_the_output(self):
+        self.assertNotIn("rules explained", self.mined(ignore=["Rules Explained"]))
+
+    def test_the_lift_is_the_median_against_the_corpus_median(self):
+        angle = self.mined()["rules explained"]
+        self.assertEqual(angle.median_metric, 2.0)
+        self.assertEqual(angle.lift, round(2.0 / 9.0, 2))
+
+    def test_the_subjects_are_reported_deduplicated_and_sorted(self):
+        self.assertEqual(self.mined()["rules explained"].subjects, ("f1", "f2", "f3"))
+
+    def test_a_phrase_counts_once_per_video_however_often_it_repeats(self):
+        rows = [
+            AngleRow(form="rules explained rules explained", metric=1.0, group=g, subjects=(s,))
+            for g, s in (("a", "f1"), ("b", "f2"), ("c", "f3"))
+        ]
+        self.assertEqual(
+            mine_angles(rows, min_videos=3, min_groups=3, min_subjects=3)[0].videos, 3
+        )
+
+    def test_an_empty_corpus_returns_nothing_rather_than_raising(self):
+        self.assertEqual(mine_angles([]), [])
+
+    def test_a_thin_angle_says_so_on_the_row(self):
+        self.assertTrue(self.mined()["rules explained"].is_thin)
 
 
 if __name__ == "__main__":
