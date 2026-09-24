@@ -112,7 +112,10 @@ def run_consent(client_id: str, client_secret: str, port: int) -> dict:
         "response_type": "code",
         "scope": SCOPES,
         "access_type": "offline",
-        "prompt": "consent",
+        # select_account forces the account chooser. Without it a browser already
+        # signed in to one Google account skips straight to it, and a channel kept
+        # as a Brand Account (the usual case) never gets offered.
+        "prompt": "select_account consent",
     }
     auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(auth_params)}"
     print("Open this URL, signed into the channel's own Google account:")
@@ -151,7 +154,13 @@ def run_consent(client_id: str, client_secret: str, port: int) -> dict:
     channel_payload = _get_json(CHANNELS_URL, {"part": "id,snippet", "mine": "true"}, access_token)
     channels = channel_payload.get("items", [])
     if not channels:
-        raise RuntimeError(f"the authorized account has no channel: {channel_payload}")
+        raise RuntimeError(
+            "the account you picked has no YouTube channel. A channel is usually its own "
+            "Brand Account: run this again and, on Google's account chooser, pick the "
+            "channel's name rather than your personal account. "
+            "https://www.youtube.com/channel_switcher lists every channel you can pick. "
+            f"Google answered: {channel_payload}"
+        )
     channel = channels[0]
 
     return {
