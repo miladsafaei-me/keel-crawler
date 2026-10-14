@@ -62,6 +62,7 @@ deduped, staged raw item".
 | 2 Normalize | `clean/markdown.py` + `clean/snapshot.py` (`SnapshotStore`, `build_merged_markdown`) | done |
 | 3 Orchestrate | `models.CrawlJob` + `orchestrate.py` (`CrawlSpec`, `run_batch`, transport adapters); `progress.py` | done |
 | 4 RSS | `models.FeedSource`/`FeedItemCandidate` + `rss/{monitor,filters,triage}.py` + `crawler_rss_poll` (behind `[rss]`) | done |
+| 6 Registers | `registries/{base,companies_house,ares}.py`: `lookup(jurisdiction, number)` against an official company register, `jurisdiction_for` a free-text country, `SEARCH_PAGES` for registers with no page by number (v0.21.0, 2026-10-14) | done |
 
 Layer 1 design notes (already applied): the forex `deep_prune` flag became a neutral
 `profile` ("content"/"raw"/"link_harvest") in `browser/config.py`; Mihomo score

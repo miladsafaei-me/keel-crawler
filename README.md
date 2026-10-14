@@ -13,6 +13,7 @@ today, plus parallel/paced fetching and automatic URL discovery.
 | **2 — Normalization** | HTML/Markdown → LLM-ready text (`clean/markdown.py`) + `SnapshotStore` (`{domain}.md`, traversal-safe, prompt-wrap separated from storage). | ✅ |
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
+| **6 — Company registers** | Official company registers read by number, no key: the UK's Companies House (its public page) and the Czech ARES (JSON); a jurisdiction vocabulary, number normalisation and a search page per register a script cannot read (`registries/`). Pure `requests`. | ✅ |
 | **5 — Platform research (YouTube)** | Quota-accounted Data API client, autocomplete snapshots, per-channel outlier and pace maths, a title-form miner, and an OAuth-gated Analytics + Reporting layer for a channel's own numbers (`youtube/`). Pure `requests`, no Django. | ✅ |
 
 Cross-cutting: **parallel + paced fetching** (`BrowserFetcher.fetch_many` runs URLs
