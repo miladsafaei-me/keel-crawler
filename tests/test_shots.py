@@ -60,6 +60,10 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(shots.find_block(blocks, "The Consistency rule requires that your Best Day stays under half")["y"], 50)
         self.assertIsNone(shots.find_block(blocks, "nothing like this at all here"))
 
+    def test_a_bot_checkpoint_is_recognised(self):
+        self.assertTrue(shots.is_checkpoint([{"t": "blueberryfunded.com"}, {"t": "Performing security verification"}, {"t": "Ray ID:"}]))
+        self.assertFalse(shots.is_checkpoint([{"t": "Pricing"}, {"t": "$100,000 account 499 USD"}]))
+
     def test_a_frame_is_a_crop_around_the_block(self):
         out = shots.frame(_webp(), {"x": 100, "y": 300, "w": 400, "h": 40})
         from PIL import Image

@@ -107,6 +107,26 @@ class Rendered:
         return text_hash(self.blocks)
 
 
+#: What a bot checkpoint says instead of the page. A shot of one proves nothing and is never
+#: stored (Blueberry Funded's ten pages on 2026-10-16 all read "Performing security
+#: verification" to a headless browser).
+CHECKPOINT_PHRASES = (
+    "performing security verification", "just a moment", "checking your browser", "verify you are human",
+    "verifying you are human", "enable javascript and cookies to continue", "access denied", "attention required",
+    "ddos protection by", "please wait while we verify", "challenge-platform", "security service to protect",
+)
+
+
+def is_checkpoint(blocks: list[dict[str, Any]]) -> bool:
+    """Whether the rendered page is a bot checkpoint rather than the page: few text blocks
+    and one of the usual phrases among them."""
+    texts = [str(b.get("t") or "").lower() for b in blocks]
+    if len(texts) > 60:
+        return False
+    joined = " ".join(texts)
+    return any(phrase in joined for phrase in CHECKPOINT_PHRASES)
+
+
 def text_hash(blocks: list[dict[str, Any]]) -> str:
     """The page's visible text, hashed: what "unchanged" means to the store."""
     joined = "\n".join(str(b.get("t") or "") for b in blocks)
