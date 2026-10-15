@@ -152,11 +152,16 @@ class Renderer:
         self.timeout_ms, self.settle_ms = timeout_ms, settle_ms
         self.user_agent = user_agent or ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                                          "Chrome/129.0.0.0 Safari/537.36")
+        self._manager = None
         self._pw = None
         self._browser = None
 
     def __enter__(self) -> "Renderer":
-        self._pw = _playwright()().__enter__()
+        # The context manager is kept, not only what it returns: leaving it unexited keeps
+        # playwright's loop on the thread, and a Django command then cannot close its
+        # database connections ("cannot call this from an async context", 2026-10-16).
+        self._manager = _playwright()()
+        self._pw = self._manager.__enter__()
         self._browser = self._pw.chromium.launch(headless=self.headless, args=["--disable-blink-features=AutomationControlled"])
         return self
 
@@ -165,8 +170,11 @@ class Renderer:
             if self._browser is not None:
                 self._browser.close()
         finally:
-            if self._pw is not None:
-                self._pw.__exit__(*exc)
+            self._browser = None
+            if self._manager is not None:
+                self._manager.__exit__(*exc)
+                self._manager = None
+                self._pw = None
 
     def render(self, url: str) -> Rendered:
         """The page as one full-height PNG at the renderer's width plus its text-block map,
