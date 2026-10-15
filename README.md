@@ -14,6 +14,7 @@ today, plus parallel/paced fetching and automatic URL discovery.
 | **3 — Orchestration** | Generic `CrawlJob` status machine, `CrawlSpec`, `run_batch`, transport adapters, progress protocol. | ✅ |
 | **4 — Source monitoring (RSS)** | `feedparser` poll → dedup → stage → deterministic pre-filter (`rss/`). LLM triage/selection is a host hook → **keel-content**. Behind the `rss` extra. | ✅ |
 | **6 — Company registers** | Official company registers read by number, no key: the UK's Companies House (its public page) and the Czech ARES (JSON); a jurisdiction vocabulary, number normalisation and a search page per register a script cannot read (`registries/`). Pure `requests`. | ✅ |
+| **7 — Screenshots by version** | A page rendered full-height at 1280 px as WebP with a map of its text blocks and their rectangles, kept in a store that replaces the shot of an unchanged page and keeps both versions around a change the consumer marks as mattering (`shots.py`: `render_page`, `ShotStore`, `find_block`, `frame`). Needs the `browser` extra to render; the store needs nothing. | ✅ |
 | **5 — Platform research (YouTube)** | Quota-accounted Data API client, autocomplete snapshots, per-channel outlier and pace maths, a title-form miner, and an OAuth-gated Analytics + Reporting layer for a channel's own numbers (`youtube/`). Pure `requests`, no Django. | ✅ |
 
 Cross-cutting: **parallel + paced fetching** (`BrowserFetcher.fetch_many` runs URLs
