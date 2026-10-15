@@ -121,35 +121,66 @@ def _playwright():
     return sync_playwright
 
 
-def render_page(url: str, *, width: int = WIDTH, headless: bool = True, consent: bool = True,
-                timeout_ms: int = PAGE_TIMEOUT_MS, settle_ms: int = SETTLE_MS, user_agent: str = "") -> Rendered:
-    """The page as one full-height PNG at ``width`` plus its text-block map."""
-    from PIL import Image
+class Renderer:
+    """One browser for many pages: ``with Renderer() as r: r.render(url)``. Launching
+    Chromium costs more than most pages do (a night of 170 pages took 18 s a page with a
+    browser per page on 2026-10-16, against 2 to 7 s for the page itself)."""
 
-    sync_playwright = _playwright()
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
+    def __init__(self, *, width: int = WIDTH, headless: bool = True, consent: bool = True,
+                 timeout_ms: int = PAGE_TIMEOUT_MS, settle_ms: int = SETTLE_MS, user_agent: str = ""):
+        self.width, self.headless, self.consent = width, headless, consent
+        self.timeout_ms, self.settle_ms = timeout_ms, settle_ms
+        self.user_agent = user_agent or ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                         "Chrome/129.0.0.0 Safari/537.36")
+        self._pw = None
+        self._browser = None
+
+    def __enter__(self) -> "Renderer":
+        self._pw = _playwright()().__enter__()
+        self._browser = self._pw.chromium.launch(headless=self.headless, args=["--disable-blink-features=AutomationControlled"])
+        return self
+
+    def __exit__(self, *exc) -> None:
         try:
-            context = browser.new_context(
-                viewport={"width": width, "height": VIEWPORT_HEIGHT}, device_scale_factor=1, locale="en-US",
-                user_agent=user_agent or ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                                          "Chrome/129.0.0.0 Safari/537.36"),
-            )
+            if self._browser is not None:
+                self._browser.close()
+        finally:
+            if self._pw is not None:
+                self._pw.__exit__(*exc)
+
+    def render(self, url: str) -> Rendered:
+        """The page as one full-height PNG at the renderer's width plus its text-block map,
+        in a fresh context (no cookies or storage carried from the page before)."""
+        from PIL import Image
+
+        if self._browser is None:
+            raise RuntimeError("use Renderer as a context manager")
+        context = self._browser.new_context(
+            viewport={"width": self.width, "height": VIEWPORT_HEIGHT}, device_scale_factor=1, locale="en-US",
+            user_agent=self.user_agent,
+        )
+        try:
             page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=15_000)
             except Exception:  # noqa: BLE001 - a page that never idles is still a page
                 pass
-            page.wait_for_timeout(settle_ms)
-            if consent and page.evaluate(_CONSENT_JS):
+            page.wait_for_timeout(self.settle_ms)
+            if self.consent and page.evaluate(_CONSENT_JS):
                 page.wait_for_timeout(600)
             blocks = page.evaluate(_BLOCKS_JS, {"max": MAX_BLOCKS, "text": MAX_BLOCK_TEXT})
             png = page.screenshot(type="png", full_page=True)
         finally:
-            browser.close()
-    image = Image.open(io.BytesIO(png))
-    return Rendered(png=png, blocks=blocks, width=image.width, height=image.height, url=url)
+            context.close()
+        image = Image.open(io.BytesIO(png))
+        return Rendered(png=png, blocks=blocks, width=image.width, height=image.height, url=url)
+
+
+def render_page(url: str, **options: Any) -> Rendered:
+    """One page in a browser of its own; for many pages use :class:`Renderer`."""
+    with Renderer(**options) as renderer:
+        return renderer.render(url)
 
 
 def to_webp(png: bytes, quality: int = WEBP_QUALITY) -> bytes:
