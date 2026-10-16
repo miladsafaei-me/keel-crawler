@@ -681,6 +681,48 @@ def find_block(blocks: list[dict[str, Any]], quote: str) -> dict[str, Any] | Non
     return best
 
 
+_FIGURE = re.compile(r"[$€£]\s?\d[\d,.]*k?|\d[\d,.]*\s?%|\$?\d[\d,.]*k\b", re.I)
+REGION_HEIGHT = 420
+
+
+def find_region(blocks: list[dict[str, Any]], quote: str, *, height: int = REGION_HEIGHT) -> dict[str, Any] | None:
+    """Where a quote is spread over several small blocks (a price widget prints the
+    figure, the size and the name in separate elements), the union of the blocks that
+    hold the quote's figures within one vertical window, as a synthetic block; ``None``
+    when fewer than two of its figures sit together or the quote has no figure."""
+    figures = []
+    for token in _FIGURE.findall(quote or ""):
+        token = token.lower().replace(" ", "")
+        if token not in figures:
+            figures.append(token)
+    if not figures:
+        return None
+    hits = []
+    for block in blocks:
+        text = _norm(block.get("t", "")).replace(" ", "")
+        if any(f in text for f in figures):
+            hits.append(block)
+    if not hits:
+        return None
+    best: list[dict[str, Any]] = []
+    for anchor in hits:
+        top = int(anchor.get("y", 0))
+        group = [b for b in hits if top <= int(b.get("y", 0)) <= top + height]
+        found = {f for f in figures for b in group if f in _norm(b.get("t", "")).replace(" ", "")}
+        if len(found) > len({f for f in figures for b in best if f in _norm(b.get("t", "")).replace(" ", "")}):
+            best = group
+    if not best:
+        return None
+    matched = {f for f in figures for b in best if f in _norm(b.get("t", "")).replace(" ", "")}
+    if len(matched) < min(2, len(figures)):
+        return None
+    x0 = min(int(b["x"]) for b in best)
+    y0 = min(int(b["y"]) for b in best)
+    x1 = max(int(b["x"]) + int(b["w"]) for b in best)
+    y1 = max(int(b["y"]) + int(b["h"]) for b in best)
+    return {"t": " ".join(str(b.get("t", "")) for b in best), "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
 def frame(webp_bytes: bytes, block: dict[str, Any], *, above: int = 170, below: int = 170, pad: int = 8,
           colour: tuple[int, int, int] = (19, 18, 58), out_width: int = 1200, quality: int = 84) -> bytes:
     """A crop of the stored shot around ``block``, the block framed in ``colour``."""

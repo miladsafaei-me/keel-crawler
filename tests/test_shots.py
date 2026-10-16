@@ -175,3 +175,18 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(items[0]["rendered_at"], rendered.rendered_at)
             self.assertEqual(items[0]["blocks"][0]["t"], "Fee 500 USD")
             self.assertEqual(list(inbox.drain()), [])
+
+
+class RegionTests(unittest.TestCase):
+    def test_a_quote_spread_over_a_price_widget_is_found_as_a_region(self):
+        blocks = [
+            {"t": "BOLT", "x": 100, "y": 1000, "w": 60, "h": 20},
+            {"t": "Instant Funding", "x": 100, "y": 1030, "w": 140, "h": 20},
+            {"t": "$39", "x": 100, "y": 1060, "w": 50, "h": 40},
+            {"t": "For $2.5K account", "x": 100, "y": 1110, "w": 160, "h": 20},
+            {"t": "$479 elsewhere on the page", "x": 100, "y": 4000, "w": 160, "h": 20},
+        ]
+        region = shots.find_region(blocks, "BOLT\n\nInstant Funding\n\n$39\nFor $2.5K account\nStart Now")
+        self.assertIsNotNone(region)
+        self.assertEqual((region["y"], region["h"]), (1060, 70))
+        self.assertIsNone(shots.find_region(blocks, "no figure here at all"))
