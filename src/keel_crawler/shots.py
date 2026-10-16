@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -170,8 +170,12 @@ class Renderer:
     browser per page on 2026-10-16, against 2 to 7 s for the page itself)."""
 
     def __init__(self, *, width: int = WIDTH, headless: bool = True, consent: bool = True, expand: bool = True,
-                 timeout_ms: int = PAGE_TIMEOUT_MS, settle_ms: int = SETTLE_MS, user_agent: str = ""):
+                 timeout_ms: int = PAGE_TIMEOUT_MS, settle_ms: int = SETTLE_MS, user_agent: str = "",
+                 proxy_server: str = ""):
         self.width, self.headless, self.consent, self.expand = width, headless, consent, expand
+        #: A proxy belongs to the browser, so a renderer serves one address; open another
+        #: renderer for another address. Empty means the machine's own address.
+        self.proxy_server = proxy_server
         self.timeout_ms, self.settle_ms = timeout_ms, settle_ms
         self.user_agent = user_agent or ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                                          "Chrome/129.0.0.0 Safari/537.36")
@@ -185,7 +189,10 @@ class Renderer:
         # database connections ("cannot call this from an async context", 2026-10-16).
         self._manager = _playwright()()
         self._pw = self._manager.__enter__()
-        self._browser = self._pw.chromium.launch(headless=self.headless, args=["--disable-blink-features=AutomationControlled"])
+        options: dict[str, Any] = {"headless": self.headless, "args": ["--disable-blink-features=AutomationControlled"]}
+        if self.proxy_server:
+            options["proxy"] = {"server": self.proxy_server}
+        self._browser = self._pw.chromium.launch(**options)
         return self
 
     def __exit__(self, *exc) -> None:
@@ -238,6 +245,42 @@ def render_page(url: str, **options: Any) -> Rendered:
         return renderer.render(url)
 
 
+#: Fewer text blocks than this is a shell or an error page, not a page worth storing.
+MIN_BLOCKS = 5
+
+
+def is_readable(rendered: "Rendered") -> bool:
+    """A render that is the page: not a bot checkpoint and with text on it."""
+    return len(rendered.blocks) >= MIN_BLOCKS and not is_checkpoint(rendered.blocks)
+
+
+def render_via(url: str, addresses: Iterable[str], *, max_tries: int = 4, renderer_factory: Callable[..., Any] = Renderer,
+               on_success: Callable[[str], None] | None = None, **options: Any) -> tuple[Rendered, str] | None:
+    """Render one page through each proxy address in turn and return the first render that
+    is readable, with the address that produced it, or ``None``.
+
+    One page first, never a batch: an address that cannot read the first page is not given
+    the rest, and the caller opens a renderer on the winning address for those. A failure
+    of an address (it times out, refuses the connection) is that address's miss, never the
+    caller's. ``on_success(address)`` lets the consumer record what worked."""
+    tried = 0
+    for address in addresses:
+        if tried >= max_tries:
+            break
+        tried += 1
+        try:
+            with renderer_factory(proxy_server=address, **options) as renderer:
+                rendered = renderer.render(url)
+        except Exception as exc:  # noqa: BLE001 - a dead free proxy is the ordinary case
+            logger.info("shot via %s failed: %s", address, str(exc)[:120])
+            continue
+        if is_readable(rendered):
+            if on_success is not None:
+                on_success(address)
+            return rendered, address
+    return None
+
+
 def to_webp(png: bytes, quality: int = WEBP_QUALITY) -> bytes:
     from PIL import Image
 
@@ -284,6 +327,7 @@ class Version:
     kept: bool
     image: Path
     blocks_file: Path
+    route: str = ""
 
     @property
     def when(self) -> datetime:
@@ -320,14 +364,17 @@ class ShotStore:
         for row in index.get("versions") or []:
             stamp = str(row.get("stamp") or "")
             out.append(Version(stamp=stamp, text_hash=str(row.get("text_hash") or ""), kept=bool(row.get("kept")),
-                               image=folder / f"{stamp}.webp", blocks_file=folder / f"{stamp}.blocks.json"))
+                               image=folder / f"{stamp}.webp", blocks_file=folder / f"{stamp}.blocks.json",
+                               route=str(row.get("route") or "")))
         return sorted(out, key=lambda v: v.stamp)
 
     def record(self, slug: str, url: str, *, when: datetime, webp: bytes, blocks: list[dict[str, Any]],
-               text_hash_value: str = "", keep: bool = False) -> Version:
+               text_hash_value: str = "", keep: bool = False, route: str = "") -> Version:
         """Store one shot. ``keep=False``: it replaces the latest version unless that one
         is kept. ``keep=True``: the reading found a change that matters, so the latest
-        version becomes the kept "before" and this shot the kept "after"."""
+        version becomes the kept "before" and this shot the kept "after". ``route`` says how
+        the page was reached ("direct", "pool-browser"); it is evidence for the consumer, kept
+        on the version row."""
         folder = self._dir(slug, url)
         index = self._read_index(folder)
         index["url"] = url
@@ -349,11 +396,14 @@ class ShotStore:
         (folder / f"{stamp}.webp").write_bytes(webp)
         (folder / f"{stamp}.blocks.json").write_text(json.dumps(blocks, separators=(",", ":")), encoding="utf-8")
         versions = [v for v in versions if v.get("stamp") != stamp]
-        versions.append({"stamp": stamp, "text_hash": digest, "kept": bool(keep)})
+        row = {"stamp": stamp, "text_hash": digest, "kept": bool(keep)}
+        if route:
+            row["route"] = route
+        versions.append(row)
         index["versions"] = sorted(versions, key=lambda v: v["stamp"])
         self._write_index(folder, index)
         return Version(stamp=stamp, text_hash=digest, kept=bool(keep), image=folder / f"{stamp}.webp",
-                       blocks_file=folder / f"{stamp}.blocks.json")
+                       blocks_file=folder / f"{stamp}.blocks.json", route=route)
 
     def before(self, slug: str, url: str, when: datetime) -> Version | None:
         """The latest version taken at or before ``when``."""

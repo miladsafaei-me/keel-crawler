@@ -83,3 +83,48 @@ class StoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderViaTests(unittest.TestCase):
+    """The proxy ladder for one page, with a fake renderer (no browser)."""
+
+    @staticmethod
+    def _factory(outcomes):
+        class Fake:
+            def __init__(self, proxy_server="", **options):
+                self.proxy_server = proxy_server
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def render(self, url):
+                out = outcomes[self.proxy_server]
+                if isinstance(out, Exception):
+                    raise out
+                return shots.Rendered(png=b"", blocks=out, width=1280, height=900, url=url)
+
+        return Fake
+
+    PAGE = [{"t": f"line {i}"} for i in range(12)]
+    WALL = [{"t": "Performing security verification"}]
+
+    def test_the_first_readable_address_wins_and_is_reported(self):
+        seen = []
+        factory = self._factory({"a": self.WALL, "b": RuntimeError("refused"), "c": self.PAGE, "d": self.PAGE})
+        got = shots.render_via("https://x.example/", ["a", "b", "c", "d"], renderer_factory=factory, on_success=seen.append)
+        self.assertEqual(got[1], "c")
+        self.assertEqual(seen, ["c"])
+
+    def test_nothing_readable_returns_none_and_respects_max_tries(self):
+        factory = self._factory({"a": self.WALL, "b": self.WALL, "c": self.PAGE})
+        self.assertIsNone(shots.render_via("https://x.example/", ["a", "b", "c"], max_tries=2, renderer_factory=factory))
+
+    def test_the_route_is_kept_on_the_version_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = shots.ShotStore(Path(tmp))
+            when = datetime(2026, 10, 1, tzinfo=timezone.utc)
+            store.record("firm", "https://x.example/p", when=when, webp=_webp(), blocks=[{"t": "a"}], route="pool-browser")
+            self.assertEqual(store.versions("firm", "https://x.example/p")[0].route, "pool-browser")
