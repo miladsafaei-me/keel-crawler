@@ -64,6 +64,14 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(shots.is_checkpoint([{"t": "blueberryfunded.com"}, {"t": "Performing security verification"}, {"t": "Ray ID:"}]))
         self.assertFalse(shots.is_checkpoint([{"t": "Pricing"}, {"t": "$100,000 account 499 USD"}]))
 
+    def test_a_page_taller_than_webp_allows_is_cut_at_the_limit(self):
+        from PIL import Image
+
+        png = io.BytesIO()
+        Image.new("RGB", (1280, 20000), (255, 255, 255)).save(png, "PNG")
+        out = Image.open(io.BytesIO(shots.to_webp(png.getvalue())))
+        self.assertEqual(out.height, shots.MAX_HEIGHT)
+
     def test_a_frame_is_a_crop_around_the_block(self):
         out = shots.frame(_webp(), {"x": 100, "y": 300, "w": 400, "h": 40})
         from PIL import Image

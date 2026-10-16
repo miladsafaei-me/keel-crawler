@@ -43,6 +43,10 @@ VIEWPORT_HEIGHT = 900
 PAGE_TIMEOUT_MS = 45_000
 SETTLE_MS = 1_500
 WEBP_QUALITY = 80
+#: WebP's own limit on a side (16383 px). A taller page is cut at the limit and the blocks
+#: below it dropped: nothing a post quotes sits 16,000 px down a page, and a shot that
+#: cannot be written is worth less than one that stops short.
+MAX_HEIGHT = 16_383
 MAX_BLOCKS = 3_000
 MAX_BLOCK_TEXT = 400
 STAMP = "%Y%m%dT%H%M%SZ"
@@ -202,7 +206,9 @@ class Renderer:
         finally:
             context.close()
         image = Image.open(io.BytesIO(png))
-        return Rendered(png=png, blocks=blocks, width=image.width, height=image.height, url=url)
+        if image.height > MAX_HEIGHT:
+            blocks = [b for b in blocks if int(b.get("y", 0)) + int(b.get("h", 0)) <= MAX_HEIGHT]
+        return Rendered(png=png, blocks=blocks, width=image.width, height=min(image.height, MAX_HEIGHT), url=url)
 
 
 def render_page(url: str, **options: Any) -> Rendered:
@@ -215,7 +221,10 @@ def to_webp(png: bytes, quality: int = WEBP_QUALITY) -> bytes:
     from PIL import Image
 
     out = io.BytesIO()
-    Image.open(io.BytesIO(png)).convert("RGB").save(out, "WEBP", quality=quality, method=6)
+    image = Image.open(io.BytesIO(png)).convert("RGB")
+    if image.height > MAX_HEIGHT:
+        image = image.crop((0, 0, image.width, MAX_HEIGHT))
+    image.save(out, "WEBP", quality=quality, method=6)
     return out.getvalue()
 
 
