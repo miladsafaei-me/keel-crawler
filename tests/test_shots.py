@@ -128,3 +128,50 @@ class RenderViaTests(unittest.TestCase):
             when = datetime(2026, 10, 1, tzinfo=timezone.utc)
             store.record("firm", "https://x.example/p", when=when, webp=_webp(), blocks=[{"t": "a"}], route="pool-browser")
             self.assertEqual(store.versions("firm", "https://x.example/p")[0].route, "pool-browser")
+
+
+class WatchdogTests(unittest.TestCase):
+    def test_a_browser_process_under_this_one_is_killed_by_its_command_line(self):
+        import subprocess
+        import time
+
+        child = subprocess.Popen(["bash", "-c", "exec -a chromium-under-test sleep 30"])
+        try:
+            time.sleep(0.3)
+            killed = shots.kill_browser_processes(match=("chromium-under-test",))
+            self.assertEqual(killed, 1)
+            self.assertIsNotNone(child.wait(timeout=5))
+        finally:
+            if child.poll() is None:
+                child.kill()
+
+    def test_the_reading_stamp_is_kept_beside_the_render_stamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = shots.ShotStore(Path(tmp))
+            rendered_at = datetime(2026, 10, 17, 6, 20, tzinfo=timezone.utc)
+            reading_at = datetime(2026, 10, 17, 3, 10, tzinfo=timezone.utc)
+            version = store.record("alpha", "https://alpha.example/p", when=rendered_at, webp=_webp(),
+                                   blocks=[{"t": "x", "x": 0, "y": 0, "w": 1, "h": 1}], reading_at=reading_at)
+            self.assertEqual(version.when, rendered_at)
+            self.assertEqual(store.versions("alpha", "https://alpha.example/p")[0].reading, "20261017T031000Z")
+
+
+class InboxTests(unittest.TestCase):
+    def test_a_shot_put_during_a_crawl_is_drained_once_with_its_render_time(self):
+        import io as _io
+
+        from PIL import Image
+
+        png = _io.BytesIO()
+        Image.new("RGB", (1280, 600), (255, 255, 255)).save(png, "PNG")
+        rendered = shots.Rendered(png=png.getvalue(), blocks=[{"t": "Fee 500 USD", "x": 1, "y": 2, "w": 3, "h": 4}],
+                                  width=1280, height=600, url="https://alpha.example/pricing")
+        with tempfile.TemporaryDirectory() as tmp:
+            inbox = shots.ShotInbox(Path(tmp) / "inbox")
+            inbox.put("https://alpha.example/pricing", rendered, route="direct")
+            items = list(inbox.drain())
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["url"], "https://alpha.example/pricing")
+            self.assertEqual(items[0]["rendered_at"], rendered.rendered_at)
+            self.assertEqual(items[0]["blocks"][0]["t"], "Fee 500 USD")
+            self.assertEqual(list(inbox.drain()), [])

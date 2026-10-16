@@ -29,7 +29,10 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
+import signal
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,7 +52,12 @@ WEBP_QUALITY = 80
 MAX_HEIGHT = 16_383
 MAX_BLOCKS = 3_000
 MAX_BLOCK_TEXT = 400
+BLOCKS_BUDGET_MS = 8_000
 STAMP = "%Y%m%dT%H%M%SZ"
+#: A page that has not returned its shot by then is given up: the browser is killed from a
+#: watchdog thread, the blocked call raises, and the next page gets a fresh browser. The
+#: first real night (2026-10-16) lost three hours to one render that never returned.
+PAGE_DEADLINE_S = 150
 
 _CONSENT_JS = r"""
 () => {
@@ -86,18 +94,43 @@ _EXPAND_JS = r"""
 """
 MAX_EXPAND_CLICKS = 60
 
+# Fixed and sticky layers would sit on the full-page image at their first position only, so
+# they are hidden for the shot and shown again after it. Hidden, never removed: a consumer
+# may shoot a page it goes on reading (the crawl's own browser session).
+_HIDE_FIXED_JS = r"""
+() => {
+  const t0 = performance.now(); let hidden = 0;
+  for (const el of Array.from(document.querySelectorAll('*'))) {
+    if (performance.now() - t0 > 4000) break;
+    const pos = getComputedStyle(el).position;
+    if ((pos === 'fixed' || pos === 'sticky') && !el.hasAttribute('data-keel-shot-hidden')) {
+      el.setAttribute('data-keel-shot-hidden', el.style.visibility || '');
+      el.style.visibility = 'hidden'; hidden++;
+    }
+  }
+  return hidden;
+}
+"""
+_UNHIDE_FIXED_JS = r"""
+() => {
+  let shown = 0;
+  for (const el of Array.from(document.querySelectorAll('[data-keel-shot-hidden]'))) {
+    el.style.visibility = el.getAttribute('data-keel-shot-hidden') || '';
+    el.removeAttribute('data-keel-shot-hidden'); shown++;
+  }
+  return shown;
+}
+"""
+
 # Every element that holds text of its own, with its rectangle in page pixels: the map a
-# quote is found on later. Fixed and sticky layers are dropped first, since they would sit
-# on the full-page image at their first position only.
+# quote is found on later. Bounded in time as well as in count, so a page with a hundred
+# thousand elements cannot hold the night.
 _BLOCKS_JS = r"""
 (limits) => {
-  for (const el of Array.from(document.querySelectorAll('*'))) {
-    const pos = getComputedStyle(el).position;
-    if (pos === 'fixed' || pos === 'sticky') el.remove();
-  }
-  const out = [];
+  const out = []; const t0 = performance.now();
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
   for (let el = walker.nextNode(); el && out.length < limits.max; el = walker.nextNode()) {
+    if (performance.now() - t0 > limits.ms) break;
     const tag = el.tagName;
     if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE' || tag === 'SVG') continue;
     let own = '';
@@ -171,8 +204,10 @@ class Renderer:
 
     def __init__(self, *, width: int = WIDTH, headless: bool = True, consent: bool = True, expand: bool = True,
                  timeout_ms: int = PAGE_TIMEOUT_MS, settle_ms: int = SETTLE_MS, user_agent: str = "",
-                 proxy_server: str = ""):
+                 proxy_server: str = "", page_deadline_s: float = PAGE_DEADLINE_S):
         self.width, self.headless, self.consent, self.expand = width, headless, consent, expand
+        self.page_deadline_s = page_deadline_s
+        self._deadline_hit = False
         #: A proxy belongs to the browser, so a renderer serves one address; open another
         #: renderer for another address. Empty means the machine's own address.
         self.proxy_server = proxy_server
@@ -189,16 +224,45 @@ class Renderer:
         # database connections ("cannot call this from an async context", 2026-10-16).
         self._manager = _playwright()()
         self._pw = self._manager.__enter__()
+        self._launch()
+        return self
+
+    def _launch(self) -> None:
         options: dict[str, Any] = {"headless": self.headless, "args": ["--disable-blink-features=AutomationControlled"]}
         if self.proxy_server:
             options["proxy"] = {"server": self.proxy_server}
         self._browser = self._pw.chromium.launch(**options)
-        return self
+
+    def _ensure_browser(self) -> None:
+        """A browser the watchdog killed, or one that crashed, is replaced before the next
+        page; the playwright instance stays."""
+        if self._pw is None:
+            raise RuntimeError("use Renderer as a context manager")
+        alive = False
+        try:
+            alive = self._browser is not None and self._browser.is_connected()
+        except Exception:  # noqa: BLE001
+            alive = False
+        if alive:
+            return
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        except Exception:  # noqa: BLE001 - a dead browser cannot be closed politely
+            pass
+        self._browser = None
+        self._launch()
+
+    def _on_deadline(self) -> None:
+        self._deadline_hit = True
+        kill_browser_processes()
 
     def __exit__(self, *exc) -> None:
         try:
             if self._browser is not None:
                 self._browser.close()
+        except Exception:  # noqa: BLE001 - a browser the watchdog killed cannot be closed politely
+            pass
         finally:
             self._browser = None
             if self._manager is not None:
@@ -209,15 +273,18 @@ class Renderer:
     def render(self, url: str) -> Rendered:
         """The page as one full-height PNG at the renderer's width plus its text-block map,
         in a fresh context (no cookies or storage carried from the page before)."""
-        from PIL import Image
-
-        if self._browser is None:
-            raise RuntimeError("use Renderer as a context manager")
-        context = self._browser.new_context(
-            viewport={"width": self.width, "height": VIEWPORT_HEIGHT}, device_scale_factor=1, locale="en-US",
-            user_agent=self.user_agent,
-        )
+        self._ensure_browser()
+        self._deadline_hit = False
+        watchdog = threading.Timer(self.page_deadline_s, self._on_deadline) if self.page_deadline_s else None
+        if watchdog is not None:
+            watchdog.daemon = True
+            watchdog.start()
+        context = None
         try:
+            context = self._browser.new_context(
+                viewport={"width": self.width, "height": VIEWPORT_HEIGHT}, device_scale_factor=1, locale="en-US",
+                user_agent=self.user_agent,
+            )
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             try:
@@ -227,16 +294,103 @@ class Renderer:
             page.wait_for_timeout(self.settle_ms)
             if self.consent and page.evaluate(_CONSENT_JS):
                 page.wait_for_timeout(600)
-            if self.expand and page.evaluate(_EXPAND_JS, MAX_EXPAND_CLICKS):
-                page.wait_for_timeout(800)
-            blocks = page.evaluate(_BLOCKS_JS, {"max": MAX_BLOCKS, "text": MAX_BLOCK_TEXT})
-            png = page.screenshot(type="png", full_page=True)
+            return shoot_page(page, expand=self.expand, url=url)
+        except Exception as exc:
+            if self._deadline_hit:
+                raise RenderTimeout(f"{url}: no shot within {self.page_deadline_s:.0f}s; the browser was killed") from exc
+            raise
         finally:
-            context.close()
-        image = Image.open(io.BytesIO(png))
-        if image.height > MAX_HEIGHT:
-            blocks = [b for b in blocks if int(b.get("y", 0)) + int(b.get("h", 0)) <= MAX_HEIGHT]
-        return Rendered(png=png, blocks=blocks, width=image.width, height=min(image.height, MAX_HEIGHT), url=url)
+            if watchdog is not None:
+                watchdog.cancel()
+            if context is not None and not self._deadline_hit:
+                try:
+                    context.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+class RenderTimeout(RuntimeError):
+    """A page that did not return its shot inside the renderer's deadline."""
+
+
+def shoot_page(page, *, expand: bool = True, url: str = "", width: int = 0) -> Rendered:
+    """The shot of a page a consumer already has open: opened panels, the text-block map,
+    the full-height PNG, with fixed layers hidden for the shot and shown again after it.
+
+    This is how the crawl shoots a page in the same browser session, at the same moment, as
+    it reads the page's text (the text is read first; the expand step and the hidden layers
+    change what the page shows). ``width`` resizes the viewport first where given.
+    """
+    from PIL import Image
+
+    if width:
+        try:
+            page.set_viewport_size({"width": width, "height": VIEWPORT_HEIGHT})
+        except Exception:  # noqa: BLE001 - a persistent context may refuse; the shot is still the page
+            pass
+    if expand and page.evaluate(_EXPAND_JS, MAX_EXPAND_CLICKS):
+        page.wait_for_timeout(800)
+    page.evaluate(_HIDE_FIXED_JS)
+    try:
+        blocks = page.evaluate(_BLOCKS_JS, {"max": MAX_BLOCKS, "text": MAX_BLOCK_TEXT, "ms": BLOCKS_BUDGET_MS})
+        png = page.screenshot(type="png", full_page=True)
+    finally:
+        try:
+            page.evaluate(_UNHIDE_FIXED_JS)
+        except Exception:  # noqa: BLE001
+            pass
+    image = Image.open(io.BytesIO(png))
+    if image.height > MAX_HEIGHT:
+        blocks = [b for b in blocks if int(b.get("y", 0)) + int(b.get("h", 0)) <= MAX_HEIGHT]
+    return Rendered(png=png, blocks=blocks, width=image.width, height=min(image.height, MAX_HEIGHT), url=url or page.url)
+
+
+def _descendant_pids(root: int) -> list[int]:
+    children: dict[int, list[int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as handle:
+                stat = handle.read()
+        except OSError:
+            continue
+        try:
+            ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+        except (ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    out: list[int] = []
+    stack = [root]
+    while stack:
+        parent = stack.pop()
+        for child in children.get(parent, []):
+            out.append(child)
+            stack.append(child)
+    return out
+
+
+def kill_browser_processes(root: int | None = None, *, match: tuple[str, ...] = ("chrom",)) -> int:
+    """Kill every browser process under this process (or ``root``): the watchdog's way of
+    making a call that never returns raise. Returns how many were killed."""
+    killed = 0
+    for pid in _descendant_pids(root or os.getpid()):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                cmdline = handle.read().decode("utf-8", "replace").lower()
+        except OSError:
+            continue
+        if any(m in cmdline for m in match):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except OSError:
+                pass
+    return killed
 
 
 def render_page(url: str, **options: Any) -> Rendered:
@@ -328,6 +482,9 @@ class Version:
     image: Path
     blocks_file: Path
     route: str = ""
+    #: The reading this version belongs to, where the consumer said; the stamp itself is
+    #: the render time.
+    reading: str = ""
 
     @property
     def when(self) -> datetime:
@@ -365,16 +522,18 @@ class ShotStore:
             stamp = str(row.get("stamp") or "")
             out.append(Version(stamp=stamp, text_hash=str(row.get("text_hash") or ""), kept=bool(row.get("kept")),
                                image=folder / f"{stamp}.webp", blocks_file=folder / f"{stamp}.blocks.json",
-                               route=str(row.get("route") or "")))
+                               route=str(row.get("route") or ""), reading=str(row.get("reading") or "")))
         return sorted(out, key=lambda v: v.stamp)
 
     def record(self, slug: str, url: str, *, when: datetime, webp: bytes, blocks: list[dict[str, Any]],
-               text_hash_value: str = "", keep: bool = False, route: str = "") -> Version:
+               text_hash_value: str = "", keep: bool = False, route: str = "", reading_at: datetime | None = None) -> Version:
         """Store one shot. ``keep=False``: it replaces the latest version unless that one
         is kept. ``keep=True``: the reading found a change that matters, so the latest
-        version becomes the kept "before" and this shot the kept "after". ``route`` says how
-        the page was reached ("direct", "pool-browser"); it is evidence for the consumer, kept
-        on the version row."""
+        version becomes the kept "before" and this shot the kept "after". ``when`` is the
+        moment the page was rendered (the stamp, and what a caption dates the image to);
+        ``reading_at`` the reading it belongs to, kept beside it. ``route`` says how the page
+        was reached ("direct", "pool-browser"); it is evidence for the consumer, kept on
+        the version row."""
         folder = self._dir(slug, url)
         index = self._read_index(folder)
         index["url"] = url
@@ -399,11 +558,13 @@ class ShotStore:
         row = {"stamp": stamp, "text_hash": digest, "kept": bool(keep)}
         if route:
             row["route"] = route
+        if reading_at is not None:
+            row["reading"] = stamp_of(reading_at)
         versions.append(row)
         index["versions"] = sorted(versions, key=lambda v: v["stamp"])
         self._write_index(folder, index)
         return Version(stamp=stamp, text_hash=digest, kept=bool(keep), image=folder / f"{stamp}.webp",
-                       blocks_file=folder / f"{stamp}.blocks.json", route=route)
+                       blocks_file=folder / f"{stamp}.blocks.json", route=route, reading=row.get("reading", ""))
 
     def before(self, slug: str, url: str, when: datetime) -> Version | None:
         """The latest version taken at or before ``when``."""
@@ -417,6 +578,64 @@ class ShotStore:
 
     def size_bytes(self) -> int:
         return sum(p.stat().st_size for p in self.root.rglob("*") if p.is_file())
+
+
+class ShotInbox:
+    """Shots taken during a crawl, before the crawl's own verdict on the page is known.
+
+    A crawl that shoots a page in the browser it reads the page with (``shoot_page``) does
+    not yet know whether the reading found a change that matters, so it cannot say whether
+    the shot is to be kept. It puts the shot here; the consumer that judges the reading
+    drains the inbox into the :class:`ShotStore` with the right ``keep`` per page. One
+    directory per crawl run; each shot is a WebP, its block map and a small meta file.
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    def _base(self, url: str) -> Path:
+        return self.root / hashlib.sha1(page_key(url).encode("utf-8")).hexdigest()[:16]
+
+    def put(self, url: str, rendered: Rendered, *, route: str = "") -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
+        base = self._base(url)
+        base.with_suffix(".webp").write_bytes(to_webp(rendered.png))
+        base.with_suffix(".blocks.json").write_text(json.dumps(rendered.blocks, separators=(",", ":")), encoding="utf-8")
+        base.with_suffix(".meta.json").write_text(json.dumps({
+            "url": url, "rendered_at": rendered.rendered_at.astimezone(timezone.utc).isoformat(),
+            "text_hash": rendered.text_hash, "route": route,
+        }), encoding="utf-8")
+        return base
+
+    def drain(self) -> Iterable[dict[str, Any]]:
+        """Every shot in the inbox, oldest first, each removed as it is yielded:
+        ``{"url", "rendered_at", "text_hash", "route", "webp", "blocks"}``."""
+        if not self.root.is_dir():
+            return
+        for meta_file in sorted(self.root.glob("*.meta.json"), key=lambda p: p.stat().st_mtime):
+            base = meta_file.with_suffix("").with_suffix("")
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                webp = base.with_suffix(".webp").read_bytes()
+                blocks = json.loads(base.with_suffix(".blocks.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            finally:
+                for suffix in (".meta.json", ".webp", ".blocks.json"):
+                    try:
+                        base.with_suffix(suffix).unlink()
+                    except FileNotFoundError:
+                        pass
+            try:
+                rendered_at = datetime.fromisoformat(str(meta.get("rendered_at")))
+            except (TypeError, ValueError):
+                rendered_at = datetime.now(timezone.utc)
+            yield {"url": str(meta.get("url") or ""), "rendered_at": rendered_at, "text_hash": str(meta.get("text_hash") or ""),
+                   "route": str(meta.get("route") or ""), "webp": webp, "blocks": blocks}
+
+    def clear(self) -> None:
+        for item in self.drain():
+            del item
 
 
 # Finding a sentence on a stored shot.
