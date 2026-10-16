@@ -141,7 +141,15 @@ _BLOCKS_JS = r"""
     if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) < 0.3) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) continue;
-    out.push({t: own.slice(0, limits.text), x: Math.round(r.left + window.scrollX), y: Math.round(r.top + window.scrollY),
+    // A sentence broken over inline children (a <b> around the figure) is one block: the
+    // element's whole text where every child is inline, its own text where a child is a block.
+    let inlineOnly = true;
+    for (const c of el.children) {
+      const d = getComputedStyle(c).display;
+      if (!(d === 'inline' || d.startsWith('inline-') || d === 'contents' || d === 'none')) { inlineOnly = false; break; }
+    }
+    const text = inlineOnly && el.children.length ? ((el.innerText || '').replace(/\s+/g, ' ').trim() || own) : own;
+    out.push({t: text.slice(0, limits.text), x: Math.round(r.left + window.scrollX), y: Math.round(r.top + window.scrollY),
               w: Math.round(r.width), h: Math.round(r.height)});
   }
   return out;
