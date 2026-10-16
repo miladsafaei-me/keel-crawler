@@ -67,6 +67,25 @@ _CONSENT_JS = r"""
 }
 """
 
+# Collapsed content is opened before the shot: every <details>, and every toggle that says it
+# is closed (aria-expanded="false", the accordion pattern FTMO's trading-objectives page and
+# most help centres use), so a rule folded under a heading is on the image. At most a few
+# dozen clicks, each followed by a short wait for the page to lay out.
+_EXPAND_JS = r"""
+(limit) => {
+  let opened = 0;
+  for (const d of document.querySelectorAll('details:not([open])')) { d.open = true; opened++; }
+  const toggles = Array.from(document.querySelectorAll('[aria-expanded="false"]'));
+  for (const el of toggles.slice(0, limit)) {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue;
+    try { el.click(); opened++; } catch (e) {}
+  }
+  return opened;
+}
+"""
+MAX_EXPAND_CLICKS = 60
+
 # Every element that holds text of its own, with its rectangle in page pixels: the map a
 # quote is found on later. Fixed and sticky layers are dropped first, since they would sit
 # on the full-page image at their first position only.
@@ -150,9 +169,9 @@ class Renderer:
     Chromium costs more than most pages do (a night of 170 pages took 18 s a page with a
     browser per page on 2026-10-16, against 2 to 7 s for the page itself)."""
 
-    def __init__(self, *, width: int = WIDTH, headless: bool = True, consent: bool = True,
+    def __init__(self, *, width: int = WIDTH, headless: bool = True, consent: bool = True, expand: bool = True,
                  timeout_ms: int = PAGE_TIMEOUT_MS, settle_ms: int = SETTLE_MS, user_agent: str = ""):
-        self.width, self.headless, self.consent = width, headless, consent
+        self.width, self.headless, self.consent, self.expand = width, headless, consent, expand
         self.timeout_ms, self.settle_ms = timeout_ms, settle_ms
         self.user_agent = user_agent or ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                                          "Chrome/129.0.0.0 Safari/537.36")
@@ -201,6 +220,8 @@ class Renderer:
             page.wait_for_timeout(self.settle_ms)
             if self.consent and page.evaluate(_CONSENT_JS):
                 page.wait_for_timeout(600)
+            if self.expand and page.evaluate(_EXPAND_JS, MAX_EXPAND_CLICKS):
+                page.wait_for_timeout(800)
             blocks = page.evaluate(_BLOCKS_JS, {"max": MAX_BLOCKS, "text": MAX_BLOCK_TEXT})
             png = page.screenshot(type="png", full_page=True)
         finally:
