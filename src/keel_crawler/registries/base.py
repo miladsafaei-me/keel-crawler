@@ -39,6 +39,13 @@ class RegistryEntry:
     url: str = ""
     register: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    # The people the register names as the company's current officers (directors, the
+    # statutory body), each ``{"name", "role", "appointed_on"}`` with the name as a reader
+    # writes it and the register's own spelling in ``register_name``. Only what a reader
+    # needs to know who runs the company: never a birth date or a home address, which the
+    # registers publish and a consumer has no reason to repeat. Empty when the register's
+    # officer list could not be read; the entry itself still stands.
+    officers: list[dict[str, Any]] = field(default_factory=list)
 
 
 # How a consumer's free-text country becomes a jurisdiction key. The first pattern that

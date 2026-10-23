@@ -34,6 +34,27 @@ ARES_PAYLOAD = {
 }
 
 
+CH_OFFICERS = """<html><body><h2 id="company-appointments">3 officers / 1 resignation</h2>
+<div class="appointments-list">
+<div class="appointment-1"><h2><span id="officer-name-1"><a href="/officers/x/appointments">BEN HUR, Gil</a></span></h2>
+<dl><dt>Role <span id="officer-status-tag-1" class="status-tag">Active</span></dt><dd id="officer-role-1"> Director </dd></dl>
+<dl><dt>Date of birth</dt><dd id="officer-date-of-birth-1">January 1972</dd></dl>
+<dl><dt>Appointed on</dt><dd id="officer-appointed-on-1"> 30 August 2022 </dd></dl></div>
+<div class="appointment-2"><h2><span id="officer-name-2"><a href="/officers/y/appointments">SMITH, Jane Anne</a></span></h2>
+<dl><dt>Role <span id="officer-status-tag-2" class="status-tag">Resigned</span></dt><dd id="officer-role-2"> Secretary </dd></dl>
+<dl><dt>Appointed on</dt><dd id="officer-appointed-on-2"> 9 April 2020 </dd></dl></div>
+</div></body></html>"""
+
+ARES_VR = {"zaznamy": [{"primarniZaznam": True, "statutarniOrgany": [{"clenoveOrganu": [
+    {"datumZapisu": "2020-06-02", "datumVymazu": "2023-09-01",
+     "clenstvi": {"funkce": {"vznikFunkce": "2020-06-02", "nazev": "jednatel"}},
+     "fyzickaOsoba": {"jmeno": "OTAKAR", "prijmeni": "ŠUFFNER", "datumNarozeni": "1989-04-23"}},
+    {"datumZapisu": "2023-09-01",
+     "clenstvi": {"funkce": {"vznikFunkce": "2020-06-02", "nazev": "jednatel"}},
+     "fyzickaOsoba": {"jmeno": "OTAKAR", "prijmeni": "ŠUFFNER", "datumNarozeni": "1989-04-23"}},
+]}]}]}
+
+
 class _Answer:
     def __init__(self, status_code, text="", payload=None):
         self.status_code, self.text, self._payload = status_code, text, payload
@@ -74,8 +95,37 @@ class CompaniesHouseTests(unittest.TestCase):
         session.get.return_value = _Answer(200, CH_PAGE)
         e = lookup("gb", "12553363", session=session)
         self.assertEqual(e.number, "12553363")
-        session.get.assert_called_once()
-        self.assertTrue(session.get.call_args.args[0].endswith("/company/12553363"))
+        self.assertTrue(session.get.call_args_list[0].args[0].endswith("/company/12553363"))
+
+
+class OfficerTests(unittest.TestCase):
+    def test_companies_house_keeps_active_officers_in_a_readers_spelling(self):
+        rows = companies_house.parse_officers(CH_OFFICERS)
+        self.assertEqual(rows, [{"name": "Gil Ben Hur", "register_name": "BEN HUR, Gil", "role": "Director",
+                                 "appointed_on": "2022-08-30"}])
+
+    def test_no_birth_date_or_address_is_kept(self):
+        rows = companies_house.parse_officers(CH_OFFICERS) + ares.parse_officers(ARES_VR)
+        self.assertTrue(all(set(r) == {"name", "register_name", "role", "appointed_on"} for r in rows))
+
+    def test_ares_keeps_the_current_member_once_and_names_the_role_in_english(self):
+        rows = ares.parse_officers(ARES_VR)
+        self.assertEqual(rows, [{"name": "Otakar Šuffner", "register_name": "OTAKAR ŠUFFNER",
+                                 "role": "Executive director", "appointed_on": "2020-06-02"}])
+
+    def test_lookup_reads_the_officers_beside_the_entry(self):
+        session = mock.Mock()
+        session.get.side_effect = [_Answer(200, CH_PAGE), _Answer(200, CH_OFFICERS)]
+        e = lookup("gb", "12553363", session=session)
+        self.assertEqual([o["name"] for o in e.officers], ["Gil Ben Hur"])
+        self.assertTrue(session.get.call_args_list[1].args[0].endswith("/company/12553363/officers"))
+
+    def test_an_unreadable_officer_list_leaves_the_entry_standing(self):
+        session = mock.Mock()
+        session.get.side_effect = [_Answer(200, CH_PAGE), _Answer(503)]
+        e = lookup("gb", "12553363", session=session)
+        self.assertEqual(e.name, "FIVE PERCENT ONLINE LTD")
+        self.assertEqual(e.officers, [])
 
 
 class AresTests(unittest.TestCase):

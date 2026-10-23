@@ -6,6 +6,11 @@
 in ``#company-status``, the incorporation date in ``#company-creation-date``, the
 registered address in ``#roa-address``. The REST API needs a free
 key and a quota, and the page carries the same fields, so the page is read.
+
+The officers are read from the company's ``/officers`` page (2026-10-23): one
+``appointment-N`` block per person with ``#officer-name-N`` ("SURNAME, Given"),
+``#officer-role-N``, ``#officer-appointed-on-N`` and ``#officer-status-tag-N``
+("Active" or "Resigned"). Only active appointments are kept.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import requests
 from .base import ACTIVE, DISSOLVED, OTHER, RegistryEntry, RegistryError
 
 PAGE = "https://find-and-update.company-information.service.gov.uk/company/{number}"
+OFFICERS = PAGE + "/officers"
 REGISTER = "Companies House"
 
 _STATUS = {
@@ -108,6 +114,70 @@ def parse(html: str, number: str) -> RegistryEntry:
     )
 
 
+class _Officers(HTMLParser):
+    """Collects each appointment's name, role, appointment date and status by its id."""
+
+    FIELD = re.compile(r"^officer-(name|role|appointed-on|status-tag)-(\d+)$")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: dict[int, dict[str, str]] = {}
+        self._into: tuple[int, str] | None = None
+        self._depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        m = self.FIELD.match(dict(attrs).get("id") or "")
+        if m:
+            self._into, self._depth = (int(m.group(2)), m.group(1)), 1
+            self.rows.setdefault(int(m.group(2)), {}).setdefault(m.group(1), "")
+        elif self._into:
+            self._depth += 1
+
+    def handle_endtag(self, tag):
+        if self._into:
+            self._depth -= 1
+            if self._depth <= 0:
+                self._into = None
+
+    def handle_data(self, data):
+        if self._into:
+            n, key = self._into
+            self.rows[n][key] += data
+
+
+def reader_name(register_name: str) -> str:
+    """"BEN HUR, Gil" as a reader writes it: "Gil Ben Hur"."""
+    surname, _, given = _squash(register_name).partition(",")
+    surname = " ".join(w.capitalize() if w.isupper() else w for w in surname.split())
+    return f"{given.strip()} {surname}".strip() if given else surname
+
+
+def parse_officers(html: str) -> list[dict]:
+    """The active officers on one ``/officers`` page, in the page's order."""
+    p = _Officers()
+    p.feed(html)
+    out = []
+    for n in sorted(p.rows):
+        row = {k: _squash(v) for k, v in p.rows[n].items()}
+        if not row.get("name") or row.get("status-tag", "").lower() != "active":
+            continue
+        appointed = _date(row.get("appointed-on", ""))
+        out.append({"name": reader_name(row["name"]), "register_name": row["name"],
+                    "role": row.get("role", ""), "appointed_on": appointed.isoformat() if appointed else None})
+    return out
+
+
+def read_officers(number: str, *, session: requests.Session, timeout: float) -> list[dict]:
+    """The company's active officers, or an empty list when the page did not answer."""
+    try:
+        answer = session.get(OFFICERS.format(number=number), timeout=timeout)
+    except requests.RequestException:
+        return []
+    if answer.status_code != 200:
+        return []
+    return parse_officers(answer.text)
+
+
 def read(number: str, *, session: requests.Session, timeout: float) -> RegistryEntry | None:
     url = PAGE.format(number=number)
     try:
@@ -118,4 +188,6 @@ def read(number: str, *, session: requests.Session, timeout: float) -> RegistryE
         return None
     if answer.status_code != 200:
         raise RegistryError(f"Companies House answered {answer.status_code}")
-    return parse(answer.text, number)
+    entry = parse(answer.text, number)
+    entry.officers = read_officers(number, session=session, timeout=timeout)
+    return entry
