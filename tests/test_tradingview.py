@@ -12,7 +12,7 @@ FEED = """<?xml version="1.0" encoding="utf-8"?>
   <link>https://www.tradingview.com/chart/EURUSD/AbC123xy-EURUSD-4H-Lower-Highs/</link>
   <description>https://www.tradingview.com/x/Eu4Q3Eru/   Price keeps failing at 1.0953 &amp; 1.0990. Target 1.0880, 25% of the move done.</description>
   <pubDate>Fri, 20 Nov 2026 11:45:58 +0000</pubDate>
-  <content:encoded><![CDATA[<div class="avatar"><a href="https://www.tradingview.com/u/SomeAuthor/" title="User Profile"></a></div>]]></content:encoded>
+  <content:encoded><![CDATA[<div class="avatar"><a href="https://www.tradingview.com/u/SomeAuthor/" title="User Profile"></a></div><img src="https://s3.tradingview.com/userpics/1-a_mid.png"/><img src="https://s3.tradingview.com/a/AbC123xy_mid.png"/>]]></content:encoded>
 </item>
 <item>
   <title>no link item</title>
@@ -34,6 +34,7 @@ def test_parse_feed_reads_id_author_time_and_clean_text():
     assert idea.author_url == "https://www.tradingview.com/u/SomeAuthor/"
     assert idea.published.isoformat() == "2026-11-20T11:45:58+00:00"
     assert "tradingview.com/x/" not in idea.text
+    assert idea.image == "https://s3.tradingview.com/a/AbC123xy_mid.png"
     assert "1.0953 & 1.0990" in idea.text
 
 

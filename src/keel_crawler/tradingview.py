@@ -11,7 +11,7 @@ What this module does, all stdlib:
 - :func:`feed_url` and :func:`looks_like_feed`: the address of a symbol's feed and
   the acceptance test a proxy pool verifies against (:mod:`keel_crawler.proxy.batch`).
 - :func:`parse_feed`: RSS text to :class:`Idea` records (id, title, link, author,
-  time, text).
+  time, text, chart snapshot).
 - :func:`read_idea`: what an idea says, by rules: its direction (long, short or
   unknown), its timeframe, the price levels it names near a reference price, and
   whether it is an advert for a paid group.
@@ -39,6 +39,7 @@ LONG, SHORT = "long", "short"
 
 _ID = re.compile(r"/chart/[^/]+/([A-Za-z0-9]+)-")
 _AUTHOR = re.compile(r'href="(https://www\.tradingview\.com/u/([^/"]+)/)"')
+_CHART = re.compile(r'src="(https://s3\.tradingview\.com/[a-z0-9]/([A-Za-z0-9]+)_mid\.png)"')
 _SNAPSHOT = re.compile(r"https?://(?:www\.)?tradingview\.com/x/[A-Za-z0-9]+/?")
 _SPACE = re.compile(r"\s+")
 
@@ -77,6 +78,7 @@ class Idea:
     author_url: str
     published: datetime
     text: str
+    image: str = ""              # the idea's chart snapshot (932 x 550 PNG on TradingView's CDN)
 
 
 @dataclass
@@ -108,6 +110,20 @@ def clean_text(raw: str) -> str:
     return _SPACE.sub(" ", text).strip()
 
 
+def chart_image(content_html: str, idea_id: str) -> str:
+    """The snapshot of this idea's own chart in ``content:encoded``, or "".
+
+    Only TradingView's CDN address whose name is the idea's id counts, so an image
+    the author pasted into the text is never taken for the idea's chart. Showing it
+    elsewhere needs the author and TradingView credited next to it (TradingView
+    Terms, section 4, and House Rules); hotlink it, do not copy it.
+    """
+    for found in _CHART.finditer(content_html or ""):
+        if found.group(2) == idea_id:
+            return found.group(1)
+    return ""
+
+
 def parse_feed(xml_text: str) -> list:
     """Every item of a feed as an :class:`Idea`; items without a link or time are skipped."""
     try:
@@ -135,6 +151,7 @@ def parse_feed(xml_text: str) -> list:
             author_url=author.group(1) if author else "",
             published=published,
             text=clean_text(item.findtext("description") or ""),
+            image=chart_image(content, found.group(1)),
         ))
     return ideas
 
