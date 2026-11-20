@@ -380,6 +380,36 @@ The LLM "is this newsworthy?" step is the host `triage_hook`
 (`KEEL_CRAWLER["rss"]["triage_hook"]`, a dotted path) — that logic lives in
 keel-content, not here.
 
+## Use (Layer 4b: TradingView ideas and price bars, no model)
+
+Since v0.27.0. Three small stdlib modules for market commentary built from public
+trading ideas, first used by forexsignally.com's daily market view:
+
+```python
+from keel_crawler.proxy.batch import fetch_many
+from keel_crawler import tradingview as tv, quotes
+
+feeds = fetch_many([tv.feed_url("FX:EURUSD")], accept=tv.looks_like_feed)
+bars = fetch_many([quotes.chart_url("EURUSD=X")], accept=quotes.looks_like_chart)
+ideas = tv.parse_feed(feeds[tv.feed_url("FX:EURUSD")] or "")
+price = quotes.parse_chart(bars[quotes.chart_url("EURUSD=X")] or "")[-1][1]
+reading = tv.read_idea(ideas[0].title, ideas[0].text, ref_price=price)
+# reading.direction "long"/"short"/"", reading.timeframe "4h", reading.levels [...], reading.promo
+```
+
+- `proxy.batch.fetch_many`: a short URL list through the pool, under `harvest_lock()`, each
+  URL retried on other addresses; `None` for a URL that never passed `accept`. Small pool
+  defaults (8 wanted, 400 candidates, 24 workers) because each check is one `curl` process.
+- `tradingview`: the symbol's RSS feed (about 30 newest ideas: id, title, link, author,
+  time, text) and `read_idea`, which reads direction (title weighs three times the body, a
+  side wins with twice the other's weight), timeframe, price levels within 3% of a reference
+  price, and whether the idea advertises a paid group.
+- `quotes`: Yahoo Finance's keyless chart JSON as `[(utc time, close)]`.
+
+The idea text is for reading, never for republishing: TradingView's House Rules ask for
+permission and credit before reuse, and its Terms limit automated access. Publish your own
+aggregates and link to the idea; fetch only through the pool, a few requests every few hours.
+
 ## Versioning
 
 git-tag based, no PyPI. Tag `vX.Y.Z` must equal `pyproject` version; any `src/`
