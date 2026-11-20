@@ -403,7 +403,10 @@ reading = tv.read_idea(ideas[0].title, ideas[0].text, ref_price=price)
 - `tradingview`: the symbol's RSS feed (about 30 newest ideas: id, title, link, author,
   time, text, the chart snapshot to hotlink with credit) and `read_idea`, which reads direction (title weighs three times the body, a
   side wins with twice the other's weight), timeframe, price levels within 3% of a reference
-  price, and whether the idea advertises a paid group.
+  price, which of those are targets, stops and entries (by the label before each number, a
+  range's second number sharing the first one's role, "would invalidate" after it), the
+  methods it names from a fixed vocabulary (`METHODS`), and whether the idea advertises a paid
+  group.
 - `quotes`: Yahoo Finance's keyless chart JSON as `[(utc time, close)]`.
 
 The idea text is for reading, never for republishing: TradingView's House Rules ask for

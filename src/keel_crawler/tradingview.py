@@ -13,8 +13,9 @@ What this module does, all stdlib:
 - :func:`parse_feed`: RSS text to :class:`Idea` records (id, title, link, author,
   time, text, chart snapshot).
 - :func:`read_idea`: what an idea says, by rules: its direction (long, short or
-  unknown), its timeframe, the price levels it names near a reference price, and
-  whether it is an advert for a paid group.
+  unknown), its timeframe, the price levels it names near a reference price and
+  which of them are targets, stops and entries, the methods it names, and whether
+  it is an advert for a paid group.
 
 The text is for reading, never for republishing. TradingView's House Rules ask
 for permission and credit before anyone reuses an author's content, and its Terms
@@ -90,6 +91,12 @@ class Reading:
     timeframe_minutes: int = 0
     levels: list = field(default_factory=list)
     promo: bool = False
+    # Roles of the levels, by the words around each number (see read_roles).
+    targets: list = field(default_factory=list)
+    stops: list = field(default_factory=list)
+    entries: list = field(default_factory=list)
+    # Methods the text names, in a fixed vocabulary (see METHODS).
+    methods: list = field(default_factory=list)
 
 
 def feed_url(symbol: str) -> str:
@@ -197,14 +204,90 @@ def _levels(text: str, ref_price: float | None, band: float) -> list:
     return sorted(seen)
 
 
+# The analysis methods an idea can name, as (label, pattern). Order is the order
+# they are reported in.
+METHODS = (
+    ("Elliott wave count", r"elliott|\bwave\s*[\"']?[1-5abc]\b|impulse count"),
+    ("double top", r"double\s+top"),
+    ("double bottom", r"double\s+bottom"),
+    ("head and shoulders", r"head\s*(?:and|&)\s*shoulders"),
+    ("price channel", r"channel"),
+    ("trendline", r"trend\s?line|supply\s+line|demand\s+line"),
+    ("wedge or triangle", r"wedge|triangle"),
+    ("flag", r"\bflag\b|pennant"),
+    ("support and resistance", r"support|resistance|pivot"),
+    ("Fibonacci", r"fibonacci|\bfib\b|retracement"),
+    ("moving averages", r"moving\s+average|\bma\s?\d{2,3}\b|\bema\b|\bsma\b"),
+    ("RSI", r"\brsi\b"),
+    ("MACD", r"\bmacd\b"),
+    ("Ichimoku", r"ichimoku"),
+    ("divergence", r"divergence"),
+    ("volume profile", r"volume\s+profile|point\s+of\s+control|\bpoc\b"),
+    ("smart money concepts", r"order\s+block|fair\s+value\s+gap|\bfvg\b|liquidity\s+(?:grab|sweep)|\bbos\b|\bchoch\b"),
+    ("market structure", r"lower\s+highs|higher\s+lows|market\s+structure"),
+    ("fundamentals", r"\bfed\b|\becb\b|\bboj\b|\bboe\b|\bsnb\b|\brba\b|inflation|\bcpi\b|rate\s+(?:hike|cut)|yields?\b|payrolls|\bgdp\b"),
+)
+_METHODS = tuple((label, re.compile(pattern, re.I)) for label, pattern in METHODS)
+
+_STOP_WORDS = re.compile(r"stop[\s-]*loss|\bstop\b|\bsl\b|invalidat|cancel", re.I)
+_TARGET_WORDS = re.compile(r"target|\btp\s*\d?\b|take[\s-]*profit|objective", re.I)
+_ENTRY_WORDS = re.compile(r"\bentry|\benter\b|(?:buy|sell)\s+(?:at|from|zone|limit)", re.I)
+_AFTER_STOP = re.compile(r"^[^.]{0,60}?(?:would|will|to)\s+invalidat", re.I)
+_RANGE_JOIN = re.compile(r"^\s*(?:-|to|and)\s*$", re.I)
+
+
+def read_methods(text: str) -> list:
+    """The labels of METHODS the text names, in METHODS order."""
+    return [label for label, pattern in _METHODS if pattern.search(text or "")]
+
+
+def read_roles(text: str, ref_price: float | None, band: float = 0.03) -> dict:
+    """Which named levels are targets, stops and entries, by the words before each number.
+
+    The label is the last role word between the previous number (or 60 characters
+    back, never past the start of the sentence) and this one, so "Stop Loss: 1.1015
+    - Take Profit 1: 1.0950" gives each number its own role. The second number of a
+    range ("1.0980 - 1.0990") takes the first one's role. A number followed within
+    its sentence by "would invalidate" is a stop. Unlabelled numbers get no role.
+    """
+    roles = {"targets": [], "stops": [], "entries": []}
+    if not ref_price:
+        return roles
+    low, high = ref_price * (1 - band), ref_price * (1 + band)
+    last_end, last_role = 0, ""
+    for found in _NUMBER.finditer(text or ""):
+        value = float(found.group(1))
+        before = text[max(last_end, found.start() - 60):found.start()]
+        joined = last_end and _RANGE_JOIN.match(text[last_end:found.start()])
+        last_end = found.end()
+        before = before.rsplit(". ", 1)[-1]
+        marks = [(m.end(), role) for role, words in (("stops", _STOP_WORDS), ("targets", _TARGET_WORDS),
+                                                   ("entries", _ENTRY_WORDS)) for m in words.finditer(before)]
+        if marks:
+            role = max(marks)[1]
+        elif joined:
+            role = last_role
+        else:
+            role = "stops" if _AFTER_STOP.search(text[found.end():found.end() + 80]) else ""
+        last_role = role
+        if role and low <= value <= high and value not in roles[role]:
+            roles[role].append(value)
+    return roles
+
+
 def read_idea(title: str, text: str, ref_price: float | None = None, band: float = 0.03) -> Reading:
-    """Direction, timeframe, price levels within ``band`` of ``ref_price``, and the advert flag."""
+    """Direction, timeframe, levels near ``ref_price`` and their roles, methods, and the advert flag."""
     tf, minutes = _timeframe(title, text)
     both = title + " " + text
+    roles = read_roles(text, ref_price, band)
     return Reading(
         direction=_direction(title, text),
         timeframe=tf,
         timeframe_minutes=minutes,
         levels=_levels(both, ref_price, band),
         promo=bool(_PROMO.search(both)),
+        targets=roles["targets"],
+        stops=roles["stops"],
+        entries=roles["entries"],
+        methods=read_methods(both),
     )

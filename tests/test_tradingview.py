@@ -123,3 +123,26 @@ def test_fetch_many_retries_on_another_address(monkeypatch, tmp_path):
     out = batch.fetch_many(["https://a", "https://b"], accept=looks_like_feed, tries=3)
     assert out == {"https://a": FEED, "https://b": None}
     assert ("blocked", "p1") in calls and ("ok", "p2") in calls and calls[-1] == ("stop", None)
+
+
+def test_read_roles_by_label():
+    text = ("Potential Trading Setup - Entry Zone: 158.960 - 159.000 - Stop Loss: 159.150 - "
+            "Take Profit 1: 158.800 - Take Profit 2: 158.710")
+    reading = read_idea("USDJPY short", text, ref_price=158.9)
+    assert reading.entries == [158.96, 159.0]
+    assert reading.stops == [159.15]
+    assert reading.targets == [158.8, 158.71]
+
+
+def test_read_roles_invalidation_after_the_number_and_prose_targets():
+    text = ("My next target is the 1.0900 support area. A move back above 1.11316, the low of wave 1, "
+            "would invalidate the count. Price bounced near 1.0960.")
+    reading = read_idea("EURUSD short", text, ref_price=1.0980)
+    assert reading.targets == [1.09]
+    assert reading.stops == [1.11316]
+    assert reading.entries == []
+
+
+def test_read_methods_vocabulary():
+    text = "Blue wave \"3\" may have ended; Ichimoku cloud overhead, RSI = 29, the Fed keeps tightening."
+    assert read_idea("x", text).methods == ["Elliott wave count", "RSI", "Ichimoku", "fundamentals"]
